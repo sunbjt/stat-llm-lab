@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stat LLM Lab 交互界面</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .chat-scrollbar::-webkit-scrollbar { width: 6px; }
+        .chat-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .chat-scrollbar::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 3px; }
+    </style>
+</head>
+<body class="bg-gray-50 h-screen flex flex-col font-sans">
+
+    <header class="bg-white border-b border-gray-200 py-4 px-6 flex items-center justify-between shadow-sm">
+        <div class="flex items-center space-x-3">
+            <div class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-lg">R</div>
+            <h1 class="text-xl font-bold text-gray-800">Stat LLM Lab<span class="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-normal">SFT v0.5</span></h1>
+        </div>
+        <div id="conn-status" class="text-sm text-gray-500">WebSocket 连接中...</div>
+    </header>
+
+    <main id="chat-window" class="flex-1 overflow-y-auto p-6 space-y-6 chat-scrollbar max-w-4xl w-full mx-auto">
+        <div id="welcome-card" class="bg-white border border-gray-200 rounded-2xl p-6 shadow-sm text-center my-12">
+            <h2 class="text-2xl font-bold text-gray-800 mb-2">欢迎来到大模型统计实验室</h2>
+            <p class="text-gray-500 max-w-md mx-auto text-sm">支持指令微调后的纯中文问答。提问后，模型会实时逐字为您生成答案。</p>
+        </div>
+    </main>
+
+    <footer class="bg-white border-t border-gray-200 p-4 shadow-md">
+        <div class="max-w-4xl mx-auto flex space-x-4 items-end">
+            <div class="flex-1 bg-gray-50 border border-gray-300 rounded-2xl p-2 flex items-center focus-within:border-indigo-500 focus-within:ring-1 focus-within:ring-indigo-500">
+                <textarea id="user-input" rows="2" class="w-full bg-transparent border-0 resize-none outline-none pl-2 text-gray-700 placeholder-gray-400 text-sm" placeholder="输入您的问题，例如：什么是决策树算法？（按 Enter 发送，Shift+Enter 换行）"></textarea>
+            </div>
+            <button id="send-btn" class="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-medium px-5 py-3 rounded-2xl shadow-sm transition-all flex items-center space-x-1">
+                <span>发送</span>
+            </button>
+        </div>
+    </footer>
+
+    <script>
+        // ============================================================
+        // WebSocket 流式聊天客户端
+        // ============================================================
+        const userInput   = document.getElementById('user-input');
+        const sendBtn     = document.getElementById('send-btn');
+        const chatWindow  = document.getElementById('chat-window');
+        const welcomeCard = document.getElementById('welcome-card');
+        const connStatus  = document.getElementById('conn-status');
+
+        let ws             = null;       // WebSocket 实例
+        let currentBubble  = null;       // 当前正在追加文本的 AI 气泡
+        let isGenerating   = false;      // 是否正在生成中（防止重复提交）
+        let pendingPrompt  = null;       // 如果 WS 未就绪，暂存待发 prompt
+
+        // ---- WebSocket 生命周期 ----
+        function connectWS() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl    = protocol + '//' + window.location.host + '/';
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function() {
+                connStatus.innerText = 'WebSocket 已连接';
+                connStatus.className = 'text-sm text-green-600';
+
+                // 如果有待发送的消息，立刻发送
+                if (pendingPrompt) {
+                    ws.send(JSON.stringify({ prompt: pendingPrompt }));
+                    pendingPrompt = null;
+                }
+            };
+
+            ws.onmessage = function(event) {
+                const token = event.data;
+
+                // 生成结束信号
+                if (token === '[[DONE]]') {
+                    finishGeneration();
+                    return;
+                }
+
+                // 错误信号
+                if (token.startsWith('[[ERROR]]')) {
+                    const errMsg = token.substring(9); // 去掉 "[[ERROR]]"
+                    if (currentBubble) {
+                        currentBubble.innerText = '错误: ' + errMsg;
+                        currentBubble.classList.add('text-red-500');
+                    }
+                    finishGeneration();
+                    return;
+                }
+
+                // 正常 token：逐字追加到当前气泡
+                if (currentBubble) {
+                    currentBubble.innerText += token;
+                    chatWindow.scrollTop = chatWindow.scrollHeight;
+                }
+            };
+
+            ws.onclose = function() {
+                connStatus.innerText = 'WebSocket 已断开 (3 秒后自动重连)';
+                connStatus.className = 'text-sm text-amber-600';
+                if (isGenerating) finishGeneration();
+                // 自动重连
+                setTimeout(connectWS, 3000);
+            };
+
+            ws.onerror = function() {
+                connStatus.innerText = 'WebSocket 连接失败';
+                connStatus.className = 'text-sm text-red-500';
+            };
+        }
+
+        function finishGeneration() {
+            isGenerating  = false;
+            currentBubble = null;
+            setInputEnabled(true);
+        }
+
+        function setInputEnabled(enabled) {
+            userInput.disabled = !enabled;
+            sendBtn.disabled   = !enabled;
+            if (enabled) {
+                userInput.focus();
+            }
+        }
+
+        // ---- 聊天气泡 ----
+        function appendMessage(sender, text) {
+            if (welcomeCard) welcomeCard.remove();
+
+            const msgRow = document.createElement('div');
+            msgRow.className = 'flex ' + (sender === 'user' ? 'justify-end' : 'justify-start');
+
+            const container = document.createElement('div');
+            container.className = 'flex items-start space-x-3 max-w-[75%]';
+            
+            // AI 消息添加头像
+            if (sender === 'ai') {
+                const avatar = document.createElement('div');
+                avatar.className = 'w-8 h-8 bg-indigo-100 rounded-full flex items-center justify-center flex-shrink-0';
+                avatar.innerHTML = '<span class="text-indigo-600 font-bold text-sm">AI</span>';
+                container.appendChild(avatar);
+            }
+
+            const bubble = document.createElement('div');
+            bubble.className =
+                'rounded-2xl px-4 py-3 text-sm shadow-sm leading-relaxed whitespace-pre-wrap ' +
+                (sender === 'user'
+                    ? 'bg-indigo-600 text-white rounded-br-none'
+                    : 'bg-white border border-gray-200 text-gray-800 rounded-bl-none');
+            bubble.innerText = text;
+
+            container.appendChild(bubble);
+            msgRow.appendChild(container);
+            chatWindow.appendChild(msgRow);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+            return bubble;
+        }
+
+        // ---- 发送逻辑 ----
+        function handleSend() {
+            const prompt = userInput.value.trim();
+            if (!prompt) return;
+            if (isGenerating) return; // 生成中不允许发送
+
+            // 渲染用户消息
+            appendMessage('user', prompt);
+            userInput.value = '';
+
+            // 检查 WebSocket 是否就绪
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                // WS 尚未就绪，暂存 prompt 等待 onopen 自动发送
+                pendingPrompt = prompt;
+                currentBubble = appendMessage('ai', '正在连接服务器...');
+                if (!ws || ws.readyState === WebSocket.CLOSED) {
+                    connectWS();
+                }
+                isGenerating  = true;
+                setInputEnabled(false);
+                return;
+            }
+
+            // 创建空的 AI 气泡，等待逐字填充
+            currentBubble = appendMessage('ai', '');
+            isGenerating  = true;
+            setInputEnabled(false);
+
+            ws.send(JSON.stringify({ prompt: prompt }));
+        }
+
+        // ---- 事件绑定 ----
+        sendBtn.addEventListener('click', handleSend);
+        userInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSend();
+            }
+        });
+
+        // ---- 启动 ----
+        connectWS();
+    </script>
+</body>
+</html>

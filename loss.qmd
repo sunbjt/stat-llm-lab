@@ -1,0 +1,54 @@
+---
+title: "Model Loss Visualization"
+format: html
+params:
+  file: "lrp_loss_291147.csv"  # 在这里设置一个默认路径
+---
+
+```{r}
+library(ggplot2)
+
+# 使用 params 列表来接收外部传入的参数
+file_name <- params$file
+file_path <- file.path('checkpoints', file_name)
+loss_data <- read.csv(file_path, header = FALSE)
+
+colnames(loss_data) <- c("Epoch", "Step", "Loss")
+epoch_num <- max(loss_data$Epoch)      # 最后一个 epoch
+title_name <- paste(gsub(".*/([^_]+)_.*", "\\1", file_path), 'loss')
+```
+
+
+```{r}
+#| echo: false
+# 计算最后 16 步的平均损失（全局最后 10 行，通常是最后一个 epoch 的末尾）
+last_loss <- mean(tail(loss_data, 16)$Loss)
+
+# 准备只用于最后一个 epoch 的辅助数据框
+hline_data <- data.frame(Epoch = epoch_num, yintercept = last_loss)
+text_data <- data.frame(
+  Epoch = epoch_num,
+  x = max(loss_data$Step),                # 放在 x 轴最右端
+  y = last_loss,
+  label = paste("Last avg loss=", round(last_loss, 3))
+)
+
+ggplot(loss_data, aes(x = Step, y = Loss)) +
+  geom_line(alpha = 0.3, linewidth = 0.3) +                     # 半透明折线
+  facet_wrap(~ Epoch, scales = "free_x", ncol = 3) +
+  geom_smooth(method = "loess", formula = y ~ x, 
+              span = 0.2, se = FALSE, linewidth = 1) +        # 每个Epoch单独平滑
+  geom_hline(data = hline_data, aes(yintercept = yintercept), 
+             color = 'red', alpha = 0.5, linetype = "dashed") +
+  geom_text(data = text_data, aes(x = x, y = y, label = label),
+            hjust = 1.0, vjust = -1.5, color = "red", size = 5, alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(title = title_name, subtitle = "Each epoch in a separate facet with LOESS smooth",
+       x = "Global Steps", y = "Cross Entropy Loss") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")   # 图例放底部避免遮挡
+```
+
+
