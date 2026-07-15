@@ -8,6 +8,10 @@
 
 读者有兴趣可以访问在线 Demo（潜在空间残差预测）：<http://110.40.168.251:8080>
 
+<div align="center">
+<img src="img/server.png" alt="服务示例" width="70%">
+</div>
+
 ---
 
 2026 年 5 月，与好友 [Vivian Zhang](https://nycdatascience.com/team-member/vivian-zhang/)（NYC Data Science Academy 创始人）聊到 Yann LeCun 团队在 JEPA 方向的工作，深受启发。JEPA 那套"预测抽象特征空间而非具体像素"的理念，让我想到：如果在语言建模中也放弃直接的 token 级预测，转而在连续语义空间中做预测，会是什么效果？
@@ -206,7 +210,7 @@ $$\mathcal{L} = \mathcal{L}_{contrast} + \alpha \cdot \mathcal{L}_{CE}$$
 模型的主线路：
 
 - 当前状态 $x$ 输入至多层 Transformer 编码器，提取出高维连续的隐空间特征 $h_x$。
-- 考虑到实验 3 残差预测架构有效，因此继承残差预测架构。以 $h_x$ 为基底，通过预测器（Predictor）推断特征的相对变化量。利用残差连接（$pred\_z = h_x + \Delta$），输出对未来状态的连续特征预测值 $pred\_z$。
+- 考虑到实验 3 残差预测架构有效，因此继承残差预测架构。以 $h_x$ 为基底，通过预测器（Predictor）推断特征的相对变化量。利用残差连接 $pred\_z = h_x + \Delta$ ，输出对未来状态的连续特征预测值 $pred\_z$。
 - 真实的未来状态 $y$ 输入至结构一致但权重冻结（防表征坍塌）的目标 Transformer 编码器，得到真实的连续特征 $h_y$。
 - 将 $h_y$ 与 VQ 码本（Codebook，可以理解为人为设定了 N 个概念簇）进行余弦相似度比对，强制映射至最近的离散聚类中心。此步骤有效过滤了底层高频噪声，输出高度抽象、纯净的离散目标特征 `target_z_quantized`。
 - 计算连续预测值 `pred_z` 与离散目标值 `target_z_quantized` 之间的均方误差（MSE）。
@@ -362,7 +366,7 @@ MoE 的训练过程：
 
 ### 数据来源和清洗
 
-预训练的原始语料来自 [Minimind](https://github.com/jingyaogong/minimind) 项目（small 数据集），数据集包含了大量的指令微调数据，为了适配小参数模型的训练，因此通过 `tidydata/` 中的数据清洗流水线做了多步处理：
+该项目为了保证训练时间的可控，同时提高模型在某些领域智力水平，因此控制了预训练数据集的范围，使用语义相似性筛选了 `人工智能+数据科学+机器学习` 三个主题的相关数据。预训练的原始语料来自 [Minimind](https://github.com/jingyaogong/minimind) 项目（small 数据集）、 [Fineweb-Edu-Chinese](https://huggingface.co/datasets/opencsg/Fineweb-Edu-Chinese-V2.1) 项目 4-5 分集合等。目录 `tidydata/` 记录了关联的数据清洗的脚本：
 
 1. 基础清洗 — HTML 标签清理、引号归一化、中文纯度过滤；
 2. 去重 — MinHash + LSH 近似去重（Jaccard ≥ 0.8）
@@ -375,6 +379,8 @@ MoE 的训练过程：
 <div align="center">
 <img src="img/pmi.png" alt="PMI 分析结果" width="60%">
 </div>
+
+> 坦白讲，变更模型架构对最终的效果影响有限。恰恰是在大量的数据清洗，语料的完备度分析并补全后，语言模型才逐步有了一点智力水平。
 
 比如频率在 300 以下，PMI 有相对较高的实体：
 

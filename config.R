@@ -9,6 +9,8 @@ library(R6)
 library(tokenizers.bpe)
 torch_manual_seed(42)
 
+options(luz.force_progress_bar = TRUE) # 在 positron 下也能够显示进度条
+
 # --- Environment auto-detection ---
 is_mac <- Sys.info()["sysname"] == "Darwin"
 is_linux <- Sys.info()["sysname"] == "Linux"
