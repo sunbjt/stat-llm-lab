@@ -60,46 +60,48 @@ RtomicRoPE <- nn_module(
 # 设计核心：用当前层的表示作为 query，从所有历史层输出中检索信息。
 # 这使每个 (batch, position) 拥有独立的跨层注意力权重，而非全局共享。
 #
-# 初始化策略保证训练起点 ≈ 标准 Transformer：
+# 初始化策略保证训练起点行为正确且梯度通畅：
 #   - query_proj = 单位矩阵 → query = 当前层表示自身
-#   - 向量自点积天然最大 → softmax 初始集中在最新层
-#   - 随训练进行，query_proj 学会提取"需要检索什么"的特征方向
+#   - 1/√D 缩放 → 自点积 logit ≈ √D ≈ 17.9
+#   - 可学习温度初始为 8 → 最终缩放 = 17.9/8 ≈ 2.24
+#   - → softmax 自权重 ≈ 0.57，不饱和，梯度通畅
+#   - → 训练中温度可降可升：降 = 更聚焦最新层，升 = 更均匀跨层
 RtomicAttnRes <- nn_module(
   "RtomicAttnRes",
   initialize = function(dim) {
-    self$norm_key <- RMSNorm(dim)    # 对历史层输出做归一化
-    self$norm_q   <- RMSNorm(dim)    # 对 query（当前层输出）做归一化
+    self$dim <- dim
+    self$norm <- RMSNorm(dim)    # 对所有历史层输出做统一归一化
 
-    # Query 投影：初始化为单位矩阵，使 query ≈ 当前层归一化表示
-    # 训练中学习旋转 query 方向以检索特定层的特征
+    # Query 投影：初始化为单位矩阵，使 query = 当前层归一化表示
     self$query_proj <- nn_linear(dim, dim, bias = FALSE)
     with_no_grad({
       self$query_proj$weight$copy_(torch_eye(dim))
     })
 
-    # 可学习温度倒数 (inverse temperature)。
-    # 初始化为 log(sqrt(dim)) → tau ≈ sqrt(dim) → softmax 适度尖锐，
-    # 由于自点积最大，权重集中在最新层。训练后可降低温度来摊平分布。
-    self$inv_temp <- nn_parameter(torch_tensor(log(sqrt(dim))))
+    # 可学习温度（除数形式）。初始化为 log(8)，使 softmax 不过于尖锐。
+    # 由于 1/√D 已做好基本缩小，再加温度确保不饱和、梯度流通。
+    self$log_temp <- nn_parameter(torch_tensor(log(8.0)))
   },
 
   forward = function(history_outputs) {
     n_hist <- length(history_outputs)
-    # 将历史层输出 detach 作为静态 key-value store。
-    # 梯度只需流过 query（当前层表示），而不过历史层 keys——
-    # 这消除了 O(N²) 梯度路径，防止梯度爆炸导致 NaN。
+    # 【关键】历史层 detach：梯度只需流过 query，不过历史层 keys。
+    # 1/√D + 温度缩放保证 softmax 不饱和 → query_proj/log_temp 可学习。
+    # detach 消除 O(N²) 梯度路径 → 梯度复杂度 = O(N)，与标准 Transformer 相同。
     H <- torch_stack(lapply(history_outputs, function(h) h$detach()), dim = 1) # [L, B, S, D]
-    H_norm <- self$norm_key(H)                                                   # [L, B, S, D]
+    H_norm <- self$norm(H)                                                      # [L, B, S, D]
 
-    # Content-based query: 用最新层的表示作为 query（保留梯度）
-    current <- history_outputs[[n_hist]]                # [B, S, D]
-    query <- self$query_proj(self$norm_q(current))      # [B, S, D]
+    # Content-based query: 当前层表示 → 归一化 → 单位矩阵投影 → 1/√D 缩放
+    current <- history_outputs[[n_hist]]                 # [B, S, D]
+    query <- self$query_proj(self$norm(current))         # [B, S, D]
+    query <- query / sqrt(self$dim)                      # 标准 attention 缩放
 
-    # query · key: 自点积天然最大 → softmax 初始集中在最新层
+    # query · H_norm: 自点积 ≈ √D/1 ≈ 17.9，他点积 ≈ N(0,1)
+    # 温度缩放后自 logit ≈ 2.24 → softmax 不饱和，梯度通畅
     logits <- torch_einsum("b s d, l b s d -> l b s", list(query, H_norm))
-    logits <- logits * torch_exp(self$inv_temp)         # 可学习温度
+    logits <- logits / torch_exp(self$log_temp)          # 可学习温度
 
-    weights <- nnf_softmax(logits, dim = 1)             # [L, B, S]
+    weights <- nnf_softmax(logits, dim = 1)              # [L, B, S]
 
     # 加权融合原始历史输出（非归一化，保留 scale 信息）
     h_l <- torch_einsum("l b s, l b s d -> b s d", list(weights, H))
