@@ -59,15 +59,14 @@ RtomicRoPE <- nn_module(
 RtomicAttnRes <- nn_module(
   "RtomicAttnRes",
   initialize = function(dim) {
-    self$pseudo_query <- nn_parameter(torch_zeros(dim))
+    # 随机初始化打破对称性，配合残差连接让每层注意力的初始偏好不同
+    self$pseudo_query <- nn_parameter(torch_randn(dim) * 0.02)
     self$norm <- RMSNorm(dim)
   },
   
   forward = function(history_outputs) {
-    if (length(history_outputs) == 1) {
-      return(history_outputs[[1]])
-    }
-    
+    # 始终走完整的 attention residual 路径，确保所有参数都参与计算图，
+    # 避免 AMP 梯度 unscaling 时因部分参数无梯度而报 "tensor does not have a device"
     H <- torch_stack(history_outputs, dim = 1) # [L, B, S, D]
     H_norm <- self$norm(H)
     
@@ -105,8 +104,8 @@ RtomicBlock <- nn_module(
   },
 
   forward = function(history_outputs) {
-    # 1. 跨层检索替代传统的输入累加
-    x <- self$attn_res(history_outputs)
+    # 1. 跨层检索 + identity 残差：保证梯度高速通道，避免训练初期梯度被 softmax 均匀权重稀释
+    x <- self$attn_res(history_outputs) + history_outputs[[length(history_outputs)]]
     
     B <- x$size(1); S <- x$size(2); D <- x$size(3)
     h_norm <- self$norm1(x)

@@ -17,6 +17,12 @@ if (is_mac) {
   ENV_WORKERS     <- 2
 }
 
+# --- 注意力机制选择 ---
+# TRUE  = KDA 线性代理 (O(S·D²) 内存，D>128 时极慢/易 NaN，仅适合小 dim 实验)
+# FALSE = 标准 Scaled Dot-Product Attention (Flash-Attn 加速，训练稳定快速)
+USE_KDA_PROXY <- FALSE
+
+
 # =====================================================================
 # 1. 内存友好型数据集构建 (Lazy Tensorization)
 # =====================================================================
@@ -147,10 +153,11 @@ if(FALSE){
       optimizer = custom_grouped_optim
     ) |>
     set_hparams(
-      vocab_size = VOCAB_SIZE, dim = DIM, n_layers = N_LAYERS, n_heads = N_HEADS, max_seq_len = SEQ_LEN
+      vocab_size = VOCAB_SIZE, dim = DIM, n_layers = N_LAYERS, n_heads = N_HEADS, max_seq_len = SEQ_LEN,
+      use_kda_proxy = USE_KDA_PROXY
     ) |>
     # 初始化的 lr 不重要，lr_finder 会自动从极小值（如 1e-7）开始成倍放大
-    set_opt_hparams(lr = 1e-5, weight_decay = 0.01) |> 
+    set_opt_hparams(lr = 1e-5, weight_decay = 0.01) |>
     lr_finder(
       data = train_dl,
       end_lr = 0.1     # 通常扫描到 0.1 就能看到模型崩溃点了
@@ -219,103 +226,14 @@ fitted_k3 <- RtomicK3 |>
     optimizer = custom_grouped_optim
   ) |>
   set_hparams(
-    vocab_size = VOCAB_SIZE, dim = DIM, n_layers = N_LAYERS, n_heads = N_HEADS, max_seq_len = SEQ_LEN
+    vocab_size = VOCAB_SIZE, dim = DIM, n_layers = N_LAYERS, n_heads = N_HEADS, max_seq_len = SEQ_LEN,
+    use_kda_proxy = USE_KDA_PROXY
   ) |>
   set_opt_hparams(lr = 5e-4, weight_decay = 0.01) |>
-#  set_opt_hparams(lr = 2e-3, weight_decay = 0.01) |>
   fit(
     data = train_dl,
     epochs = TRAIN_EPOCHS,
     accelerator = accelerator(),
     callbacks = base_callbacks,
-    verbose = TRUE
-  )
-
-
-# =====================================================================
-# 如果需要可以继续第二阶段训练 (热启动)
-# =====================================================================
-
-luz_callback_warm_start <- luz_callback(
-  "warm_start",
-  initialize = function(path, base_lr = 1e-4) { self$path <- path; self$lr <- base_lr },
-  
-  on_fit_begin = function() {
-    ckpt <- torch_load(self$path, device = "cpu")
-    ctx$model$load_state_dict(ckpt$model)
-    
-    if ("optimizers" %in% names(ckpt)) {
-      to_dev <- function(x) {
-        if (inherits(x, "torch_tensor")) return(x$to(device = ctx$device))
-        if (is.list(x)) return(lapply(x, to_dev))
-        return(x)
-      }
-      
-      opt_dict <- ckpt$optimizers[[1]]
-      opt_dict$state <- to_dev(opt_dict$state)
-      ctx$optimizers[[1]]$load_state_dict(opt_dict)
-      
-      # 覆盖学习率
-      for (i in seq_along(ctx$optimizers[[1]]$param_groups)) {
-        ctx$optimizers[[1]]$param_groups[[i]]$lr <- self$lr
-      }
-      cat("\n 参数与冲量已同步至", as.character(ctx$device), "，开始训练！\n")
-    }
-  }
-)
-
-luz_callback_simple_batch <- luz_callback(
-  "simple_batch",
-  
-  initialize = function(
-    filename = paste0("checkpoints/k3_pre_loss_", format(Sys.time(), "%H%M%S"), ".csv")
-    ) {
-    self$file <- filename
-  },
-  
-  on_train_batch_end = function() {
-    cat(ctx$epoch, ",", ctx$iter, ",", as.numeric(ctx$loss[[1]]), "\n", 
-        file = self$file, append = TRUE)
-  }
-)
-
-RESUME_EPOCHS <- 2
-resume_total_steps <- RESUME_EPOCHS * length(train_dl)
-
-stage2_callbacks <- list(
-  luz_callback_warm_start("checkpoints/k3_02.pt", base_lr = 1e-4),
-  # 重新挂载 WSD 调度器 (针对新的总步数)
-  luz_callback_lr_scheduler(
-    torch::lr_lambda,
-    lr_lambda = function(step) {
-      wsd_multiplier(step, total_steps = resume_total_steps, warmup_pct = 0.1, decay_pct = 0.2)
-    },
-    call_on = "on_train_batch_end"
-  ),
-  luz_callback_model_checkpoint(
-    path = "checkpoints/stage2_k3_{epoch:02d}.pt",
-    save_best_only = FALSE, monitor = "train_loss"
-  ),
-  luz_callback_simple_batch()
-)
-
-if (ENV_USE_AMP && cuda_is_available()) {
-  stage2_callbacks <- append(stage2_callbacks, list(luz_callback_mixed_precision()))
-}
-
-fitted_k3_stage2 <- Rtomic |>
-  setup(
-    loss = function(output, target) output$loss,
-    optimizer = custom_grouped_optim
-  ) |>
-  set_hparams(
-    vocab_size = VOCAB_SIZE, dim = DIM, n_layers = N_LAYERS, n_heads = N_HEADS, max_seq_len = SEQ_LEN
-  ) |>
-  set_opt_hparams(lr = 1e-4, weight_decay = 0.01) |>
-  fit(
-    data = train_dl,
-    epochs = RESUME_EPOCHS,
-    accelerator = accelerator(),
-    callbacks = stage2_callbacks,
     verbose = TRUE
   )
