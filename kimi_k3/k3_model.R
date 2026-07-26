@@ -55,25 +55,53 @@ RtomicRoPE <- nn_module(
   }
 )
 
-# 3. 新增: 跨层注意力残差模块 (Attention Residuals)
+# 3. 跨层注意力残差模块 (Cross-Layer Attention Residuals)
+#
+# 设计核心：用当前层的表示作为 query，从所有历史层输出中检索信息。
+# 这使每个 (batch, position) 拥有独立的跨层注意力权重，而非全局共享。
+#
+# 初始化策略保证训练起点 ≈ 标准 Transformer：
+#   - query_proj = 单位矩阵 → query = 当前层表示自身
+#   - 向量自点积天然最大 → softmax 初始集中在最新层
+#   - 随训练进行，query_proj 学会提取"需要检索什么"的特征方向
 RtomicAttnRes <- nn_module(
   "RtomicAttnRes",
   initialize = function(dim) {
-    # 随机初始化打破对称性，配合残差连接让每层注意力的初始偏好不同
-    self$pseudo_query <- nn_parameter(torch_randn(dim) * 0.02)
-    self$norm <- RMSNorm(dim)
+    self$norm_key <- RMSNorm(dim)    # 对历史层输出做归一化
+    self$norm_q   <- RMSNorm(dim)    # 对 query（当前层输出）做归一化
+
+    # Query 投影：初始化为单位矩阵，使 query ≈ 当前层归一化表示
+    # 训练中学习旋转 query 方向以检索特定层的特征
+    self$query_proj <- nn_linear(dim, dim, bias = FALSE)
+    with_no_grad({
+      self$query_proj$weight$copy_(torch_eye(dim))
+    })
+
+    # 可学习温度倒数 (inverse temperature)。
+    # 初始化为 log(sqrt(dim)) → tau ≈ sqrt(dim) → softmax 适度尖锐，
+    # 由于自点积最大，权重集中在最新层。训练后可降低温度来摊平分布。
+    self$inv_temp <- nn_parameter(torch_tensor(log(sqrt(dim))))
   },
-  
+
   forward = function(history_outputs) {
-    # 始终走完整的 attention residual 路径，确保所有参数都参与计算图，
-    # 避免 AMP 梯度 unscaling 时因部分参数无梯度而报 "tensor does not have a device"
-    H <- torch_stack(history_outputs, dim = 1) # [L, B, S, D]
-    H_norm <- self$norm(H)
-    
-    # 增加缩放因子 / sqrt(dim)，防止混合精度下内积过大导致 Softmax 溢出
-    logits <- torch_einsum("d, l b s d -> l b s", list(self$pseudo_query, H_norm)) / sqrt(self$pseudo_query$size(1))
-    weights <- nnf_softmax(logits, dim = 1)
-    
+    n_hist <- length(history_outputs)
+    # 将历史层输出 detach 作为静态 key-value store。
+    # 梯度只需流过 query（当前层表示），而不过历史层 keys——
+    # 这消除了 O(N²) 梯度路径，防止梯度爆炸导致 NaN。
+    H <- torch_stack(lapply(history_outputs, function(h) h$detach()), dim = 1) # [L, B, S, D]
+    H_norm <- self$norm_key(H)                                                   # [L, B, S, D]
+
+    # Content-based query: 用最新层的表示作为 query（保留梯度）
+    current <- history_outputs[[n_hist]]                # [B, S, D]
+    query <- self$query_proj(self$norm_q(current))      # [B, S, D]
+
+    # query · key: 自点积天然最大 → softmax 初始集中在最新层
+    logits <- torch_einsum("b s d, l b s d -> l b s", list(query, H_norm))
+    logits <- logits * torch_exp(self$inv_temp)         # 可学习温度
+
+    weights <- nnf_softmax(logits, dim = 1)             # [L, B, S]
+
+    # 加权融合原始历史输出（非归一化，保留 scale 信息）
     h_l <- torch_einsum("l b s, l b s d -> b s d", list(weights, H))
     return(h_l)
   }
@@ -104,8 +132,9 @@ RtomicBlock <- nn_module(
   },
 
   forward = function(history_outputs) {
-    # 1. 跨层检索 + identity 残差：保证梯度高速通道，避免训练初期梯度被 softmax 均匀权重稀释
-    x <- self$attn_res(history_outputs) + history_outputs[[length(history_outputs)]]
+    # 1. 跨层检索：用当前层表示为 query，从所有历史层中加权提取信息。
+    #    初始化时自点积最大 → 集中在最新层 → 行为等价于标准 Transformer
+    x <- self$attn_res(history_outputs)
     
     B <- x$size(1); S <- x$size(2); D <- x$size(3)
     h_norm <- self$norm1(x)
@@ -179,10 +208,8 @@ RtomicK3 <- nn_module(
       nn_linear(dim, dim)
     )
     
-    nn_init_zeros_(self$predictor[[3]]$weight)
-    if (!is.null(self$predictor[[3]]$bias)) {
-      nn_init_zeros_(self$predictor[[3]]$bias)
-    }
+    nn_init_normal_(self$predictor[[3]]$weight, mean = 0, std = 0.02 / sqrt(dim))
+    nn_init_zeros_(self$predictor[[3]]$bias)
   },
   
   forward = function(input_data) {
