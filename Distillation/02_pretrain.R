@@ -1,16 +1,16 @@
 # =====================================================================
-# 预训练 (Train)
+# 预训练 (Train) — 优化版: 内存 Dataloader + 梯度累积 + 分块交叉熵
 # =====================================================================
 library(torch)
-library(luz)
 library(R6)
 library(tok)
+library(coro)
 torch_manual_seed(42)
-options(luz.force_progress_bar = TRUE) # 在 positron 下也能够显示进度条
 Sys.setenv(PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True")
 
 ## 环境专属超参 (覆盖默认值)
 is_mac       <- Sys.info()["sysname"] == "Darwin"
+is_gpu       <- !is_mac && cuda_is_available()
 DIM          <- 320
 N_LAYERS     <- 8
 N_HEADS      <- 8
@@ -18,82 +18,87 @@ SEQ_LEN      <- 512
 
 if (is_mac) {
   ENV_BATCH_SIZE  <- 2
-  ENV_MAX_LINES   <- 1000
+  ENV_GRAD_ACCUM  <- 4    # 等效 Batch = 8
   ENV_USE_AMP     <- FALSE
   ENV_WORKERS     <- 0
+} else if (is_gpu) {
+  ENV_BATCH_SIZE  <- 8    # 微批次大小 (受 15 万词表 logits 显存限制)
+  ENV_GRAD_ACCUM  <- 8    # 等效 Batch = 8 × 8 = 64
+  ENV_USE_AMP     <- TRUE
+  ENV_WORKERS     <- 0    # 数据全在内存，无需多进程
 } else {
   ENV_BATCH_SIZE  <- 64
-  ENV_MAX_LINES   <- -1
-  ENV_USE_AMP     <- TRUE
+  ENV_GRAD_ACCUM  <- 1
+  ENV_USE_AMP     <- FALSE
   ENV_WORKERS     <- 2
 }
 
+# 设备检测
+device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
+cat(sprintf("训练设备: %s | Micro-Batch: %d | Grad-Accum: %d | 等效 Batch: %d\n",
+            device$type, ENV_BATCH_SIZE, ENV_GRAD_ACCUM, ENV_BATCH_SIZE * ENV_GRAD_ACCUM))
+
 # =====================================================================
-# 1. 内存友好型数据集构建 (Lazy Tensorization)
+# 1. 纯内存 Dataloader (零磁盘 I/O 阻塞)
+#    一次性将整个 .bin 文件载入内存 Tensor，后续通过 narrow() 零拷贝切片
 # =====================================================================
 source("Distillation/LRP_model.R")
 
-tokenizer_file <- "models/tokenizer.json" 
+tokenizer_file <- "models/tokenizer.json"
 tokenizer <- tok::tokenizer$from_file(tokenizer_file)
 VOCAB_SIZE <- tokenizer$get_vocab_size()
-
+cat(sprintf("Qwen Tokenizer 词表大小: %d\n", VOCAB_SIZE))
 
 RtomicBinDataset <- dataset(
   name = "RtomicBinDataset",
-  
+
   initialize = function(bin_file, seq_len = 256, vocab_size = 151936, bytes_per_token = 4) {
-    self$bin_file <- bin_file
     self$seq_len <- seq_len
-    self$vocab_size <- vocab_size
-    self$bytes_per_token <- bytes_per_token
-    
     file_info <- file.info(bin_file)
     total_bytes <- file_info$size
     total_tokens <- total_bytes / bytes_per_token
-    
-    self$chunk_size <- seq_len 
-    self$num_batches <- floor(total_tokens / self$chunk_size)
-    
+
     cat(sprintf("物理总 Token 数: %.2f M\n", total_tokens / 1e6))
-    cat(sprintf("按 SEQ_LEN = %d 极速读取，总计生成 %d 个纯净训练块\n", 
-                seq_len, self$num_batches))
-  },
-  
-  .getitem = function(i) {
-    start_token <- (i - 1) * self$chunk_size
-    offset_bytes <- start_token * self$bytes_per_token
-    
-    con <- file(self$bin_file, "rb")
-    seek(con, where = offset_bytes, origin = "start")
-    chunk <- readBin(con, what = "integer", n = self$chunk_size, 
-                     size = self$bytes_per_token, endian = "little")    
+    cat(sprintf("正在将全部数据载入内存...\n"))
+
+    # 一次性读取整个文件
+    con <- file(bin_file, "rb")
+    raw_tokens <- readBin(con, what = "integer", n = total_tokens,
+                          size = bytes_per_token, signed = TRUE, endian = "little")
     close(con)
-    
-    # 将 Qwen 的 [0, vocab_size-1] 整体平移 +1，转换为 R torch 的 [1, vocab_size]
-    chunk_1based <- chunk + 1L
-    
-    x_ids <- chunk_1based[1:(self$seq_len - 1)]
-    y_ids <- chunk_1based[2:self$seq_len]
-    
-    x <- torch_tensor(x_ids, dtype = torch_long())
-    y <- torch_tensor(y_ids, dtype = torch_long())
-    
+
+    # Qwen Token ID 是 0-based，R torch 需要 1-based，整体 +1
+    raw_tokens <- raw_tokens + 1L
+    self$data_tensor <- torch_tensor(raw_tokens, dtype = torch_long())
+    self$num_batches <- floor((total_tokens - 1) / self$seq_len)
+
+    cat(sprintf("数据加载完成！生成 %d 个训练块 (序列长度: %d)\n",
+                self$num_batches, seq_len))
+  },
+
+  .getitem = function(i) {
+    # 零拷贝 narrow 切片，几乎无耗时
+    start_idx <- (i - 1) * self$seq_len + 1
+    chunk <- self$data_tensor$narrow(dim = 1, start = start_idx, length = self$seq_len + 1)
+
+    x <- chunk[1:self$seq_len]
+    y <- chunk[2:(self$seq_len + 1)]
+
     list(x = list(x = x, y = y), y = y)
   },
-  
+
   .length = function() {
     self$num_batches
   }
 )
 
-# 挂载时，不再传 CORPUS_FILE，而是传之前跑出来的 .bin 文件
 BIN_FILE <- "data/processed/qwen_tokens_aligned.bin"
 
 train_dataset <- RtomicBinDataset(
   bin_file = BIN_FILE,
   seq_len = SEQ_LEN,
-  vocab_size = VOCAB_SIZE, # 确保 >= 151936
-  bytes_per_token = 4      # 必须匹配 size = 4
+  vocab_size = VOCAB_SIZE,
+  bytes_per_token = 4      # Qwen Token ID 需要 32-bit
 )
 
 train_dl <- dataloader(
@@ -102,11 +107,12 @@ train_dl <- dataloader(
   shuffle = TRUE,
   drop_last = TRUE,
   num_workers = ENV_WORKERS,
-  pin_memory = !is_mac
+  pin_memory = is_gpu
 )
 
-
-# 3. 训练循环配置
+# =====================================================================
+# 2. 优化器 & 学习率调度器
+# =====================================================================
 custom_grouped_optim <- function(params, lr = 1e-3, weight_decay = 0.01, ...) {
   emb_names <- grep("^tok_emb|^pos_emb", names(params), value = TRUE)
   other_names <- setdiff(names(params), emb_names)
@@ -120,99 +126,131 @@ custom_grouped_optim <- function(params, lr = 1e-3, weight_decay = 0.01, ...) {
 
 # WSD (Warmup - Stable - Decay) 学习率乘子计算器
 wsd_multiplier <- function(step, total_steps, warmup_pct = 0.1, decay_pct = 0.1) {
-  # 强制类型转换，防止除法产生浮点数误差
-  current_step <- as.numeric(step) + 1 
+  current_step <- as.numeric(step) + 1
   total_steps <- as.numeric(total_steps)
-  
+
   warmup_steps <- total_steps * warmup_pct
   decay_steps <- total_steps * decay_pct
   stable_steps <- total_steps - warmup_steps - decay_steps
-  
+
   if (current_step <= warmup_steps) {
-    # 阶段 1: 线性 Warmup (从 0 爬升到 100% 火力)
     return(current_step / warmup_steps)
-    
   } else if (current_step <= warmup_steps + stable_steps) {
-    # 阶段 2: Stable (全程保持 100% 满血火力)
     return(1.0)
-    
   } else {
-    # 阶段 3: 余弦 Decay (从 100% 平滑衰减到 5% 保底)
     decay_step <- current_step - (warmup_steps + stable_steps)
     progress <- decay_step / decay_steps
-    
-    # 余弦退火公式：平滑且优雅的着陆
     cosine_decay <- 0.5 * (1 + cos(pi * progress))
-    
-    # 设定保底乘子 0.1，防止学习率彻底变成 0 导致后期死寂
     return(max(0.1, cosine_decay))
   }
 }
 
-# 极简版 Batch Loss 记录器
-luz_callback_simple_batch <- luz_callback(
-  "simple_batch",
-  initialize = function(
-    filename = paste0("checkpoints/qwen_loss_", format(Sys.time(), "%d%H%M"), ".csv")
-    ) {
-    self$file <- filename
-  },
-  on_train_batch_end = function() {
-    cat(ctx$epoch, ",", ctx$iter, ",", as.numeric(ctx$loss[[1]]), "\n", 
-        file = self$file, append = TRUE)
-  }
-)
+# =====================================================================
+# 3. 模型初始化
+# =====================================================================
+model <- RtomicLRP(VOCAB_SIZE, DIM, N_LAYERS, N_HEADS, SEQ_LEN)
+model$to(device = device)
+cat(sprintf("模型已加载至: %s\n", device$type))
 
-# 梯度裁剪 (Gradient Clipping) 回调器
-luz_callback_clip_grad <- luz_callback(
-  "clip_grad",
-  initialize = function(max_norm = 1.0) {
-    self$max_norm <- max_norm
-  },
-  on_backward_end = function() {
-    # ctx$model$parameters 会自动获取当前网络内所有需要求导的权重
-    # 强制在 backward 之后、optimizer$step 之前将异常梯度剪碎
-    torch::nn_utils_clip_grad_norm_(ctx$model$parameters, max_norm = self$max_norm)
-  }
-)
-
-# 建立全局训练轮数（单一事实来源）
+# =====================================================================
+# 4. 训练配置
+# =====================================================================
 TRAIN_EPOCHS <- 3
-total_steps <- TRAIN_EPOCHS * length(train_dl)
+# 实际优化步数 = 总 batch 数 / 梯度累积步数
+total_steps <- (TRAIN_EPOCHS * length(train_dl)) / ENV_GRAD_ACCUM
+cat(sprintf("总训练步数 (优化器更新次数): %.0f\n", total_steps))
 
-base_callbacks <- list(
-  luz_callback_lr_scheduler(
-    torch::lr_lambda,
-    lr_lambda = function(step) {
-      wsd_multiplier(step, total_steps = total_steps, warmup_pct = 0.1, decay_pct = 0.2)
-    },
-    call_on = "on_train_batch_end" # 核心：强制精确到每一步更新
-  ),
-  luz_callback_simple_batch(), # 挂载极简 Batch 记录器
-  luz_callback_clip_grad(1.0),
-  luz_callback_model_checkpoint(
-    path = "checkpoints/lrp_{epoch:02d}.pt", save_best_only = FALSE, monitor = "train_loss"
-    )
+# 学习率缩放法则: LR_new = LR_base × sqrt(K)
+lr_rate <- sqrt(ENV_GRAD_ACCUM)
+optimizer <- custom_grouped_optim(model$parameters, lr = lr_rate * 2e-3, weight_decay = 0.01)
+scheduler <- lr_lambda(
+  optimizer,
+  lr_lambda = function(step) wsd_multiplier(step, total_steps, warmup_pct = 0.1, decay_pct = 0.2)
 )
 
-if (ENV_USE_AMP && cuda_is_available()) {
-  base_callbacks <- append(base_callbacks, list(luz_callback_mixed_precision()))
-  cat("已挂载混合精度训练 (AMP) 回调\n")
+# AMP 混合精度
+use_scaler <- ENV_USE_AMP && cuda_is_available()
+if (use_scaler) {
+  scaler <- cuda_amp_grad_scaler()
+  cat("已启用 AMP 混合精度训练 (bfloat16)\n")
 }
 
-fitted_lrp <- RtomicLRP |>
-  setup(
-    loss = function(output, target) output$loss,
-    optimizer = custom_grouped_optim
-  ) |>
-  set_hparams(
-    vocab_size = VOCAB_SIZE, dim = DIM, n_layers = N_LAYERS, n_heads = N_HEADS, max_seq_len = SEQ_LEN
-  ) |>
-  set_opt_hparams(lr = 2e-3, weight_decay = 0.01) |>
-  fit(
-    data = train_dl,
-    epochs = TRAIN_EPOCHS,
-    accelerator = accelerator(),
-    callbacks = base_callbacks,
-    verbose = TRUE
-  )
+# Loss 记录文件
+loss_log_file <- paste0("checkpoints/qwen_loss_", format(Sys.time(), "%d%H%M"), ".csv")
+cat(sprintf("Loss 日志: %s\n", loss_log_file))
+
+# =====================================================================
+# 5. 手动训练循环 (支持梯度累积)
+# =====================================================================
+global_step <- 0
+model$train()
+
+for (epoch in 1:TRAIN_EPOCHS) {
+  iter_idx <- 0
+  epoch_loss <- 0
+
+  coro::loop(for (b in train_dl) {
+    iter_idx <- iter_idx + 1
+
+    # 异步 CPU → GPU 传输
+    batch_x <- b$x$x$to(device = device, non_blocking = TRUE)
+    batch_y <- b$y$to(device = device, non_blocking = TRUE)
+
+    # 前向传播 (AMP 自动混合精度)
+    if (use_scaler) {
+      with_autocast(device_type = "cuda", dtype = torch_bfloat16(), enabled = TRUE, {
+        output <- model(list(x = batch_x, y = batch_y))
+        loss <- output$loss / ENV_GRAD_ACCUM
+      })
+    } else {
+      output <- model(list(x = batch_x, y = batch_y))
+      loss <- output$loss / ENV_GRAD_ACCUM
+    }
+
+    # 反向传播
+    if (use_scaler) {
+      scaler$scale(loss)$backward()
+    } else {
+      loss$backward()
+    }
+
+    # 达到累积阈值，执行权重更新
+    if (iter_idx %% ENV_GRAD_ACCUM == 0) {
+      if (use_scaler) {
+        scaler$unscale_(optimizer)
+        torch::nn_utils_clip_grad_norm_(model$parameters, max_norm = 1.0)
+        scaler$step(optimizer)
+        scaler$update()
+      } else {
+        torch::nn_utils_clip_grad_norm_(model$parameters, max_norm = 1.0)
+        optimizer$step()
+      }
+
+      optimizer$zero_grad()
+      scheduler$step()
+      global_step <- global_step + 1
+
+      current_loss <- as.numeric(output$loss)  # 原始 Loss (未缩放)
+      epoch_loss <- epoch_loss + current_loss
+
+      # 记录到 CSV
+      cat(sprintf("%d,%d,%.6f\n", epoch, global_step, current_loss),
+          file = loss_log_file, append = TRUE)
+
+      if (global_step %% 20 == 0 || global_step == 1) {
+        cat(sprintf("Epoch: %d | Step: %d | Loss: %.4f | LR: %.2e\n",
+                    epoch, global_step, current_loss, optimizer$param_groups[[2]]$lr))
+      }
+    }
+  })
+
+  avg_loss <- epoch_loss / (iter_idx / ENV_GRAD_ACCUM)
+  cat(sprintf("Epoch %d 完成, Avg Loss: %.4f\n", epoch, avg_loss))
+
+  # 保存 Checkpoint
+  checkpoint_path <- sprintf("checkpoints/lrp_%02d.pt", epoch)
+  torch_save(model$state_dict(), checkpoint_path)
+  cat(sprintf("已保存 Checkpoint: %s\n", checkpoint_path))
+}
+
+cat("\n预训练完成！\n")
