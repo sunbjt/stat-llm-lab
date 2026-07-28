@@ -64,14 +64,18 @@ id_map_lookup[keep_old_ids + 1L] <- 0:(NEW_VOCAB_SIZE - 1L)
 NEW_EOS_ID <- id_map_lookup[EOS_ID + 1L]
 NEW_PAD_ID <- id_map_lookup[PAD_ID + 1L]
 
+# 指定 UNK 的新 ID（直接复用 PAD_ID，或者指定为词表里的某位）
+NEW_UNK_ID <- NEW_PAD_ID
+
 # 保存映射配置，供之后 Teacher 蒸馏切片 logits (teacher_logits[,, keep_old_ids + 1]) 使用！
 mapping_file <- "models/qwen_vocab_mapping.rds"
 saveRDS(list(
-  keep_old_ids = keep_old_ids, # 旧 ID 列表 (0-based)
+  keep_old_ids = keep_old_ids,
   id_map_lookup = id_map_lookup,
   new_vocab_size = NEW_VOCAB_SIZE,
   new_eos_id = NEW_EOS_ID,
-  new_pad_id = NEW_PAD_ID
+  new_pad_id = NEW_PAD_ID,
+  new_unk_id = NEW_UNK_ID # 存入 UNK ID
 ), file = mapping_file)
 cat(sprintf("映射配置已保存至: %s\n", mapping_file))
 
@@ -113,9 +117,17 @@ while (length(lines <- readLines(con_in, n = chunk_size, warn = FALSE)) > 0) {
   # 批量编码
   encoded_batch <- tokenizer$encode_batch(texts)
   
-  # 提取 ids 并在每篇文章尾部焊上一个 EOS[cite: 1]
+  # 提取 ids 并在每篇文章尾部焊上一个 EOS
   id_list <- lapply(encoded_batch, function(res) {
-    c(res$ids, EOS_ID)
+    # 1. O(1) 查表：将原始 ID 映射到新的 0-based 精简 ID
+    mapped_ids <- id_map_lookup[res$ids + 1L]
+    
+    # 2. 🚀 关键修改：将未命中的 -1L 批量替换为 NEW_UNK_ID，不再执行向量过滤！
+    # 这样可以 100% 保持原始文本的序列长度和句法结构不被破坏
+    mapped_ids[mapped_ids == -1L] <- NEW_UNK_ID
+    
+    # 3. 焊上新的 EOS Token ID
+    c(mapped_ids, NEW_EOS_ID)
   })
   
   # 展平为一维数组，像香肠一样无缝拼接[cite: 1]
@@ -145,7 +157,7 @@ if (remainder > 0) {
               remainder, pad_len, BLOCK_TARGET))
   
   # 在末尾补上 PAD，同样必须保持 size = 4
-  writeBin(as.integer(rep(PAD_ID, pad_len)), con_bin, size = 4, endian = "little")
+  writeBin(as.integer(rep(NEW_PAD_ID, pad_len)), con_bin, size = 4, endian = "little")
   total_tokens_processed <- total_tokens_processed + pad_len
 }
 

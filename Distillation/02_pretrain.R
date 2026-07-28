@@ -69,7 +69,7 @@ RtomicBinDataset <- dataset(
     con <- file(self$bin_file, "rb")
     seek(con, where = offset_bytes, origin = "start")
     chunk <- readBin(con, what = "integer", n = self$chunk_size, 
-                     size = self$bytes_per_token, signed = FALSE, endian = "little")
+                     size = self$bytes_per_token, endian = "little")    
     close(con)
     
     # 将 Qwen 的 [0, vocab_size-1] 整体平移 +1，转换为 R torch 的 [1, vocab_size]
