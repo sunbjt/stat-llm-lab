@@ -4,6 +4,7 @@
 library(torch)
 library(luz)
 library(R6)
+library(tok)
 torch_manual_seed(42)
 options(luz.force_progress_bar = TRUE) # 在 positron 下也能够显示进度条
 Sys.setenv(PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True")
@@ -32,14 +33,10 @@ if (is_mac) {
 # =====================================================================
 source("Distillation/LRP_model.R")
 
-#tokenizer_file <- "models/tokenizer.json" 
-#tokenizer <- tok::tokenizer$from_file(tokenizer_file)
-#VOCAB_SIZE <- tokenizer$get_vocab_size()
+tokenizer_file <- "models/tokenizer.json" 
+tokenizer <- tok::tokenizer$from_file(tokenizer_file)
+VOCAB_SIZE <- tokenizer$get_vocab_size()
 
-# 直接加载之前保存的词表映射配置，获取精简后的真实词表大小 (126421)
-mapping_file <- "models/qwen_vocab_mapping.rds"
-vocab_mapping <- readRDS(mapping_file)
-VOCAB_SIZE <- vocab_mapping$new_vocab_size
 
 RtomicBinDataset <- dataset(
   name = "RtomicBinDataset",
