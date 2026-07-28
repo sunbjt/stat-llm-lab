@@ -5,7 +5,7 @@ source("Distillation/atomic_blocks.R")
 # 沿词表维度分块计算 log-sum-exp，避免显存中物化完整的 [N, V] logits 矩阵
 # 对于 Qwen 15 万词表，可将峰值显存从 ~20 GB 降至 ~200 MB
 # =====================================================================
-chunked_cross_entropy <- function(hidden, embed_weight, targets, chunk_size = 8192L) {
+chunked_cross_entropy <- function(hidden, embed_weight, targets, chunk_size = 32768L) {
   # hidden:        [N, D] 展平后的隐状态
   # embed_weight:  [V, D] 词嵌入权重矩阵 (与 tok_emb 共享)
   # targets:       [N]    目标 token ID (R torch 1-based 索引)
@@ -44,8 +44,8 @@ chunked_cross_entropy <- function(hidden, embed_weight, targets, chunk_size = 81
   }
 
   # ---- 阶段 2: 直接点积获取目标 logit ----
-  # 使用 index_select (0-based) 安全索引，避免 R torch 索引语义歧义
-  target_emb <- embed_weight$index_select(1, targets - 1L)       # [N, D]
+  # embed_weight 使用 1-based R 索引 (与 nn_embedding 对齐)
+  target_emb <- embed_weight[targets, drop = FALSE]               # [N, D]
   target_logits <- torch_sum(hidden * target_emb, dim = 2, keepdim = TRUE)  # [N, 1]
   target_logits_fp32 <- target_logits$to(dtype = torch_float32())
 
