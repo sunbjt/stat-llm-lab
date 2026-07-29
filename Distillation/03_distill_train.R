@@ -1,194 +1,131 @@
-# Distillation/02_distill_train.R
 # =====================================================================
-# 序列蒸馏训练：用教师模型（Qwen3.5-2B）的回答训练 RtomicCausalLM
-# 完全复用 causal_lm/03_causal_sft_train.R 的训练管线
+# 教师 Logits 离线提炼 — 本地文件版 (无需联网)
+# 从本地 models/ 目录加载 Qwen3.5-2B 权重，对预训练数据做 Top-K logit 提取
 # =====================================================================
 
-source("config.R")
+library(torch)
+library(minhub)  # 仅用于 qwen3() 构造函数和 qwen3_hf_weights_remap (不联网)
+library(tok)
 
-# --- 环境专属超参 ---
-BATCH_SIZE  <- if (is_mac) 2 else 32
-device      <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
-cat(sprintf("当前运行设备: %s\n", device$type))
+# ---- 设备和环境 ----
+is_mac <- Sys.info()["sysname"] == "Darwin"
+has_cuda <- cuda_is_available()
+DEVICE <- if (has_cuda) "cuda" else if (is_mac) "mps" else "cpu"
+USE_BF16 <- has_cuda  # 3090 原生支持 bf16, CPU/MPS 不支持
+MODEL_DTYPE <- if (USE_BF16) torch_bfloat16() else torch_float32()
+cat(sprintf("计算设备: %s | 精度: %s\n", DEVICE, if (USE_BF16) "bfloat16" else "float32"))
 
-TEACHER_DATA <- "Distillation/teacher_outputs.jsonl"
+# ---- 配置 ----
+MODEL_DIR     <- "models"
+BIN_INPUT     <- "data/processed/qwen_tokens_aligned.bin"
+LOGITS_OUTPUT <- "data/processed/teacher_top16_logits.bin"
+SEQ_LEN       <- 512L
+BATCH_SIZE    <- 8L
+K             <- 16L
 
-# =====================================================================
-# 1. 加载 Tokenizer 与模型架构
-# =====================================================================
-source("utils/BPETokenizer.R")
-source("causal_lm/CausalLM_model.R")
+# ---- 1. 从本地 config.json 解析模型架构参数 (不需要联网) ----
+cat("从本地 config.json 读取模型架构...\n")
+config <- jsonlite::fromJSON(file.path(MODEL_DIR, "config.json"))
+tc <- config$text_config
 
-tokenizer <- RtomicBPETokenizer$new(model_file = BPE_MODEL_FILE, vocab_size = VOCAB_SIZE)
-
-# =====================================================================
-# 2. SFT 数据集（与 causal_lm/03_causal_sft_train.R 完全一致）
-#    唯一区别：数据的 output 字段换成了 teacher_response
-# =====================================================================
-GenerativeSFTDataset <- dataset(
-  name = "GenerativeSFTDataset",
-  initialize = function(prompts, responses, tokenizer, max_len) {
-    self$prompts   <- prompts
-    self$responses <- responses
-    self$tokenizer <- tokenizer
-    self$max_len   <- max_len
-  },
-
-  .getitem = function(i) {
-    p_ids <- self$tokenizer$encode_raw(self$prompts[i])[[1]]
-    p_ids <- c(self$tokenizer$bos_idx, p_ids)
-
-    r_ids <- self$tokenizer$encode_raw(self$responses[i])[[1]]
-    eos_val <- if (!is.null(self$tokenizer$eos_idx)) self$tokenizer$eos_idx else 4L
-    r_ids <- c(r_ids, eos_val)
-
-    full_seq <- c(p_ids, r_ids)
-    seq_len  <- length(full_seq)
-
-    x_ids <- full_seq[1:(seq_len - 1)]
-    y_ids <- full_seq[2:seq_len]
-
-    mask <- c(rep(FALSE, length(p_ids) - 1), rep(TRUE, length(r_ids)))
-
-    pad_len <- self$max_len - length(x_ids)
-    if (pad_len > 0) {
-      x_ids <- c(x_ids, rep(1L, pad_len))
-      y_ids <- c(y_ids, rep(1L, pad_len))
-      mask  <- c(mask,  rep(FALSE, pad_len))
-    } else {
-      x_ids <- x_ids[1:self$max_len]
-      y_ids <- y_ids[1:self$max_len]
-      mask  <- mask[1:self$max_len]
-    }
-
-    list(
-      x         = torch_tensor(x_ids, dtype = torch_long()),
-      y         = torch_tensor(y_ids, dtype = torch_long()),
-      loss_mask = torch_tensor(mask,  dtype = torch_bool())
-    )
-  },
-  .length = function() length(self$prompts)
+# 映射 config.json → qwen3() 构造函数参数
+# 注意: layer_types 在 text_config 内部, 不在 config 顶层
+teacher <- qwen3(
+  vocab_size = tc$vocab_size,
+  n_embd     = tc$hidden_size,
+  n_inter    = tc$intermediate_size,
+  n_head     = tc$num_attention_heads,
+  n_kv_head  = tc$num_key_value_heads,
+  head_dim   = tc$head_dim,
+  n_layer    = tc$num_hidden_layers,
+  max_pos    = tc$max_position_embeddings,
+  rmsnorm_eps = tc$rms_norm_eps,
+  rope_base  = tc$rope_parameters$rope_theta,
+  partial_rotary_factor = tc$rope_parameters$partial_rotary_factor,
+  layer_types = tc$layer_types,
+  n_k_heads   = if (!is.null(tc$linear_num_key_heads)) tc$linear_num_key_heads else 16,
+  n_v_heads   = if (!is.null(tc$linear_num_value_heads)) tc$linear_num_value_heads else 16,
+  k_head_dim  = if (!is.null(tc$linear_key_head_dim)) tc$linear_key_head_dim else 128,
+  v_head_dim  = if (!is.null(tc$linear_value_head_dim)) tc$linear_value_head_dim else 128,
+  conv_kernel_size = if (!is.null(tc$linear_conv_kernel_dim)) tc$linear_conv_kernel_dim else 4
 )
 
-# =====================================================================
-# 3. 加载教师蒸馏数据
-# =====================================================================
-cat(sprintf("\n[Distill] 加载教师蒸馏数据: %s\n", TEACHER_DATA))
-teacher_data <- jsonlite::stream_in(file(TEACHER_DATA), verbose = FALSE)
+# ---- 2. 从本地 safetensors 加载权重 (不需要联网) ----
+weights_file <- file.path(MODEL_DIR, "model.safetensors-00001-of-00001.safetensors")
+cat(sprintf("正在从本地文件加载权重: %s (%.1f GB)...\n",
+            weights_file, file.info(weights_file)$size / 1e9))
 
-# 过滤空回答
-empty_mask <- nchar(trimws(teacher_data$teacher_response)) < 5
-if (any(empty_mask)) {
-  cat(sprintf("[Distill] 过滤掉 %d 条过短回答\n", sum(empty_mask)))
-  teacher_data <- teacher_data[!empty_mask, ]
-}
-cat(sprintf("[Distill] 有效数据: %d 条\n", nrow(teacher_data)))
+# safetensors 是独立格式, 不能用 torch::load_state_dict() 直接读
+# minhub 内部用 safetensors::safe_load_file()
+state_dict <- safetensors::safe_load_file(weights_file, framework = "torch")
 
-# =====================================================================
-# 4. 实例化模型并热启动预训练权重
-# =====================================================================
-model <- RtomicCausalLM(VOCAB_SIZE, DIM, N_LAYERS, N_HEADS, SEQ_LEN)
+# 重映射 HF 权重名 → minhub 内部命名 (minhub 内部函数, 不需要联网)
+state_dict <- minhub:::qwen3_hf_weights_remap(state_dict)
+teacher$load_state_dict(state_dict, .refer_to_state_dict = TRUE)
 
-PRETRAIN_CKPT <- "checkpoints/causal_model_03.pt"
-if (file.exists(PRETRAIN_CKPT)) {
-  cat(sprintf("[Distill] 正在加载预训练底座: %s\n", PRETRAIN_CKPT))
-  ckpt        <- torch_load(PRETRAIN_CKPT)
-  state_dict  <- if (!is.null(ckpt$model)) ckpt$model else ckpt
+cat("权重加载完成。\n")
 
-  # 动态扩展位置编码（如果预训练 seq_len < SFT seq_len）
-  old_pos_emb <- state_dict[["pos_emb.weight"]]
-  if (!is.null(old_pos_emb)) {
-    old_len <- old_pos_emb$size(1)
-    if (old_len < SEQ_LEN) {
-      cat(sprintf("[Distill] 位置编码 %d -> %d\n", old_len, SEQ_LEN))
-      new_pos_emb <- torch_empty(c(SEQ_LEN, DIM))
-      nn_init_normal_(new_pos_emb, std = 0.02)
-      new_pos_emb[1:old_len, ] <- old_pos_emb
-      state_dict[["pos_emb.weight"]] <- new_pos_emb
-    }
-  }
-  model$load_state_dict(state_dict, strict = FALSE)
-} else {
-  cat("[Distill] 未找到预训练权重，从头随机初始化！\n")
-}
+# ---- 3. 转移到设备并设为 eval 模式 ----
+# GPU (3090): 保持 bf16 权重, 更快更省显存
+# CPU/Mac: 必须转为 float32, CPU 不支持 bf16 运算
+teacher$to(dtype = MODEL_DTYPE, device = DEVICE)
+teacher$eval()
+cat(sprintf("模型已部署到 %s。\n", DEVICE))
 
-model <- model$to(device = device)
+# ---- 4. 读取 Token 数据并构建 DataLoader ----
+cat(sprintf("读取 Token 数据: %s\n", BIN_INPUT))
+con_in <- file(BIN_INPUT, "rb")
+total_tokens <- file.info(BIN_INPUT)$size / 4
+tokens <- readBin(con_in, what = "integer", n = total_tokens, size = 4, signed = TRUE)
+close(con_in)
 
-# =====================================================================
-# 5. 层冻结策略
-# =====================================================================
-for (p in model$parameters) { p$requires_grad_(TRUE) }
+# 模型需要 1-based token IDs (与训练时一致)
+tokens <- tokens + 1L
 
-FREEZE_LAYERS <- 0L
-cat(sprintf("[Distill] 冻结前 %d 层\n", FREEZE_LAYERS))
+num_chunks  <- floor(length(tokens) / SEQ_LEN)
+tokens_mat  <- matrix(tokens[1:(num_chunks * SEQ_LEN)], ncol = SEQ_LEN, byrow = TRUE)
+tokens_tens <- torch_tensor(tokens_mat, dtype = torch_long())
 
-if (FREEZE_LAYERS > 0) {
-  for (i in 1:FREEZE_LAYERS) {
-    lapply(model$layers[[i]]$parameters, function(p) p$requires_grad_(FALSE))
-  }
-}
+dataset    <- tensor_dataset(tokens_tens)
+dataloader <- dataloader(dataset, batch_size = BATCH_SIZE, shuffle = FALSE)
+cat(sprintf("总共 %d 个 chunk, %d 个 batch。\n", num_chunks, length(dataloader)))
 
-# =====================================================================
-# 6. Dataloader
-# =====================================================================
-sft_ds <- GenerativeSFTDataset(
-  teacher_data$prompt,
-  teacher_data$teacher_response,   # <-- 核心改动：用教师回答
-  tokenizer,
-  max_len = SEQ_LEN
-)
-sft_dl <- dataloader(sft_ds, batch_size = BATCH_SIZE, shuffle = TRUE)
+# ---- 5. GPU 高速提取 Top-K Logits ----
+con_out <- file(LOGITS_OUTPUT, "wb")
+cat("开始提取 Top-16 Logits...\n")
 
-# =====================================================================
-# 7. 训练循环
-# =====================================================================
-trainable_params <- Filter(function(p) p$requires_grad, model$parameters)
-optimizer <- optim_adamw(trainable_params, lr = 3e-4, weight_decay = 0.01)
-
-EPOCHS    <- 5L
-scheduler <- lr_cosine_annealing(optimizer, T_max = EPOCHS)
-
-cat("\n[Distill] 启动蒸馏训练...\n\n")
-
-for (epoch in 1:EPOCHS) {
-  model$train()
-  total_loss <- 0
-  batch_idx  <- 0
-  current_lr <- optimizer$param_groups[[1]]$lr
-
-  coro::loop(for (batch in sft_dl) {
+with_no_grad({
+  batch_idx <- 0
+  coro::loop(for (b in dataloader) {
     batch_idx <- batch_idx + 1
-    optimizer$zero_grad()
+    input_ids <- b[[1]]$to(device = DEVICE)
 
-    input_data <- list(
-      x         = batch$x$to(device = device),
-      y         = batch$y$to(device = device),
-      loss_mask = batch$loss_mask$to(device = device)
-    )
+    out <- teacher(input_ids)
+    logits <- if (is.list(out)) out$logits else out
 
-    output <- model(input_data)
-    loss   <- output$loss
+    # GPU 端 Top-K
+    topk_res <- torch_topk(logits, k = K, dim = -1)
 
-    loss$backward()
-    nn_utils_clip_grad_norm_(model$parameters, max_norm = 1.0)
-    optimizer$step()
+    # 还原为 0-based Qwen ID 并切回 CPU
+    topk_indices <- (topk_res[[2]] - 1L)$to(device = "cpu")
+    topk_values  <- topk_res[[1]]$to(device = "cpu")
 
-    total_loss <- total_loss + loss$item()
+    b_size <- input_ids$size(1)
+    for (i in seq_len(b_size)) {
+      idx_array <- as.integer(as_array(topk_indices[i]))
+      val_array <- as.numeric(as_array(topk_values[i]))
 
-    if (batch_idx %% 10 == 0 || batch_idx == 1) {
-      cat(sprintf("[Distill] Epoch %d/%d | Step %d | LR %.6f | Loss %.4f\n",
-                  epoch, EPOCHS, batch_idx, current_lr, loss$item()))
+      writeBin(idx_array, con_out, size = 4, endian = "little")
+      writeBin(val_array, con_out, size = 4, endian = "little")
+    }
+
+    if (batch_idx %% 50 == 0) {
+      cat(sprintf("已完成: %d/%d batches (%.1f%%)\n",
+                  batch_idx, length(dataloader),
+                  (batch_idx / length(dataloader)) * 100))
     }
   })
+})
 
-  avg_loss <- total_loss / batch_idx
-  cat(sprintf("[Distill] Epoch %d 完成, Avg Loss: %.4f\n", epoch, avg_loss))
-
-  scheduler$step()
-
-  save_path <- sprintf("checkpoints/distill_epoch_%02d.pt", epoch)
-  torch_save(model$state_dict(), save_path)
-  cat(sprintf("[Distill] 已保存: %s\n", save_path))
-}
-
-cat("\n[Distill] 蒸馏训练完成！\n")
+close(con_out)
+cat(sprintf("✅ 教师 Top-%d Logits 提炼完成！\n输出文件: %s\n", K, LOGITS_OUTPUT))

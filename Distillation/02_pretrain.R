@@ -22,7 +22,7 @@ if (is_mac) {
   ENV_USE_AMP     <- FALSE
   ENV_WORKERS     <- 0
 } else if (is_gpu) {
-  ENV_BATCH_SIZE  <- 8    # 微批次大小 (受 15 万词表 logits 显存限制)
+  ENV_BATCH_SIZE  <- 24    # 微批次大小 (受 15 万词表 logits 显存限制)
   ENV_GRAD_ACCUM  <- 8    # 等效 Batch = 8 × 8 = 64
   ENV_USE_AMP     <- TRUE
   ENV_WORKERS     <- 0    # 数据全在内存，无需多进程
@@ -155,7 +155,7 @@ cat(sprintf("模型已加载至: %s\n", device$type))
 # =====================================================================
 # 4. 训练配置
 # =====================================================================
-TRAIN_EPOCHS <- 3
+TRAIN_EPOCHS <- 1
 # 实际优化步数 = 总 batch 数 / 梯度累积步数
 total_steps <- (TRAIN_EPOCHS * length(train_dl)) / ENV_GRAD_ACCUM
 cat(sprintf("总训练步数 (优化器更新次数): %.0f\n", total_steps))
@@ -248,7 +248,7 @@ for (epoch in 1:TRAIN_EPOCHS) {
   cat(sprintf("Epoch %d 完成, Avg Loss: %.4f\n", epoch, avg_loss))
 
   # 保存 Checkpoint
-  checkpoint_path <- sprintf("checkpoints/lrp_%02d.pt", epoch)
+  checkpoint_path <- sprintf("checkpoints/qwen_%02d.pt", epoch)
   torch_save(model$state_dict(), checkpoint_path)
   cat(sprintf("已保存 Checkpoint: %s\n", checkpoint_path))
 }
