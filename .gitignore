@@ -1,0 +1,11 @@
+*.DS_Store
+models/
+checkpoints/
+data/
+*.ipynb
+server/qa_data.jsonl
+*.log
+tidydata/concepts_translated.jsonl
+tidydata/corpus.jsonl
+tidydata/crawl_checkpoint.Rdata
+tidydata/translate_progress.Rdata
