@@ -50,7 +50,7 @@ get_green_list <- function(context_tokens, vocab_size, key = 421337L, gamma = 0.
 }
 
 # =====================================================================
-# 1. 修正后的生成函数 (先加水印，再缩放 Temperature)
+# 1. 生成函数 (先加水印，再缩放 Temperature)
 # =====================================================================
 generate_response <- function(model, tokenizer, prompt,
                               max_new_tokens = 500,
@@ -83,7 +83,7 @@ generate_response <- function(model, tokenizer, prompt,
       cb <- model$tok_emb$weight
       logits <- torch_matmul(last_pred$unsqueeze(1), cb$t())$squeeze(1)
       
-      # 【关键修正 1】：先注入水印偏置
+      # 注入水印偏置
       if (use_watermark && length(current_ids) >= watermark_k) {
         context_tokens <- tail(current_ids, watermark_k)
         green_indices <- get_green_list(
@@ -95,7 +95,7 @@ generate_response <- function(model, tokenizer, prompt,
         logits[green_indices] <- logits[green_indices] + watermark_delta
       }
       
-      # 【关键修正 2】：再应用 Temperature 缩放
+      # 再应用 Temperature 缩放
       logits <- logits / temperature
       
       # 重复惩罚
@@ -136,7 +136,7 @@ generate_response <- function(model, tokenizer, prompt,
 }
 
 # =====================================================================
-# 2. 修正后的检测函数 (隔离 Prompt，仅检测模型生成部分)
+# 2. 检测函数 (隔离 Prompt，仅检测模型生成部分)
 # =====================================================================
 verify_watermark <- function(prompt_ids, gen_ids, vocab_size = VOCAB_SIZE,
                              watermark_key = 421337L, watermark_gamma = 0.5,
