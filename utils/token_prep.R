@@ -3,6 +3,7 @@ source("config.R")
 library(RcppSimdJson) # 使用底层 SIMD 指令集极速解析 JSON
 library(tokenizers.bpe)
 library(R6)
+set.seed(123)
 
 # 配置路径
 jsonl_file <- "data/raw/pretrain_clean.jsonl" 
@@ -122,8 +123,8 @@ tokenizer <- RtomicBPETokenizer$new(
 # 展示合并的 token
 tail(tokenizer$model$vocabulary, 10)
 
-# 测试一下 Tokenizer 是否正常工作
-test_text <- "用这些关键词写一份简要概述：环保设施完备，充足的配备，适宜居住，拎包即可入住。"
+# 测试一下 Tokenizer 是否正常工作a
+test_text <- "这是刘思喆创造的小型LLM，可以回答回答人工智能领域的一些问题。"
 encoded_ids <- tokenizer$encode(test_text)
 decoded_text <- tokenizer$decode(encoded_ids)
 
