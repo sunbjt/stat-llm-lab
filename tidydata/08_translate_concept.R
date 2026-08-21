@@ -55,7 +55,7 @@ cat("\n--- Computing PageRank ---\n")
 g <- graph_from_data_frame(relations)
 pg <- page_rank(g)$vector
 
-top_n <- 5000
+top_n <- 30000
 top_concepts <- data.frame(name = names(pg), pagerank = as.numeric(pg)) %>%
   arrange(desc(pagerank)) %>%
   head(top_n)
@@ -96,7 +96,7 @@ deepseek_translate <- function(batch_df, api_key,
       list(role = "system", content = system_prompt),
       list(role = "user",   content = paste0("Translate these concepts:\n", concept_text))
     ),
-    temperature = 0.2
+    temperature = 0.3
   )
 
   for (attempt in seq_len(max_tries)) {

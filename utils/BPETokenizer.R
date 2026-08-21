@@ -33,20 +33,40 @@ RtomicBPETokenizer <- R6Class(
     },
     
     encode = function(text) {
-      res <- bpe_encode(self$model, x = text, type = "ids")[[1]]
+      punct_pattern <- "([,.:;!?\"'()\\{\\}\\[\\]，。！？；：—（）《》“”‘’、])"
+      clean_text <- gsub(punct_pattern, " \\1 ", text, perl = TRUE)
+      clean_text <- gsub("\\s+", " ", clean_text, perl = TRUE)
+
+      res <- bpe_encode(self$model, x = clean_text, type = "ids")[[1]]
       ids <- as.integer(res) + 1L 
       
       c(self$bos_idx, ids, self$eos_idx) 
     },
     
     encode_raw = function(text_vector) {
+      punct_pattern <- "([,.:;!?\"'()\\{\\}\\[\\]，。！？；：—（）《》“”‘’、])"
+      clean_vector <- gsub(punct_pattern, " \\1 ", text_vector, perl = TRUE)
+      clean_vector <- gsub("\\s+", " ", clean_vector, perl = TRUE)
+
       res_list <- bpe_encode(self$model, x = text_vector, type = "ids")
       lapply(res_list, function(x) as.integer(x) + 1L)
     },
     
-    decode = function(ids) {
+    decode = function(ids, clean = TRUE) {
       raw_ids <- as.integer(ids) - 1L
-      bpe_decode(self$model, x = raw_ids)
+      decoded <- bpe_decode(self$model, x = raw_ids)
+      
+      if (!clean) return(decoded)
+      
+      # 1. 过滤 Special Tokens
+      decoded <- gsub("<BOS>|<EOS>|<PAD>|<UNK>", "", decoded, perl = TRUE)
+      
+      # 2. 清除 CJK 汉字与中文标点之间的空格（保留英文/数字之间的独立空格）
+      cjk_pattern <- "(?<=[\\x{4e00}-\\x{9fa5}\\x{3000}-\\x{303f}\\x{ff00}-\\x{ffef}])\\s+(?=[\\x{4e00}-\\x{9fa5}\\x{3000}-\\x{303f}\\x{ff00}-\\x{ffef}])"
+      decoded <- gsub(cjk_pattern, "", decoded, perl = TRUE)
+      
+      # 3. 修剪首尾空格
+      trimws(decoded)
     }
   )
 )

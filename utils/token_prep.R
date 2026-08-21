@@ -76,7 +76,10 @@ extract_bpe_sample_stream <- function(
     }, character(1))
     
     texts <- texts[texts != ""]
-    
+    punct_pattern <- "([,.:;!?\"'()\\{\\}\\[\\]，。！？；：—（）《》“”‘’、])"
+    texts <- gsub(punct_pattern, " \\1 ", texts, perl = TRUE)
+    texts <- gsub("\\s+", " ", texts, perl = TRUE)
+
     # 抽样与写入
     if (length(texts) > 0) {
       keep_idx <- runif(length(texts)) < sample_rate
@@ -100,12 +103,12 @@ extract_bpe_sample_stream <- function(
   cat(sprintf("Tokenizer 训练样本已生成: %s (共抽样 %d 行)\n", bpe_sample_file, lines_sampled))
 }
 
-# 运行抽样 (0.5G 纯文本，抽样 50%)
+# 运行抽样 (0.9G 纯文本，抽样 30%)
 if (!file.exists(bpe_sample_file)) {
   extract_bpe_sample_stream(
     jsonl_file = jsonl_file, 
     bpe_sample_file = bpe_sample_file,
-    sample_rate = 0.5, 
+    sample_rate = 0.3, 
     chunk_size = 50000 
   )
 } else {
@@ -215,6 +218,10 @@ while (length(lines <- readLines(con_in, n = chunk_size, warn = FALSE)) > 0) {
     if (is.list(x) && !is.null(x$text) && !is.na(x$text)) x$text else ""
   }, character(1))
   texts <- texts[texts != ""]
+  # 提取 text 后必须同步加上隔离
+  punct_pattern <- "([,.:;!?\"'()\\{\\}\\[\\]，。！？；：—（）《》“”‘’、])"
+  texts <- gsub(punct_pattern, " \\1 ", texts, perl = TRUE)
+  texts <- gsub("\\s+", " ", texts, perl = TRUE)
   
   if (length(texts) == 0) next
   
