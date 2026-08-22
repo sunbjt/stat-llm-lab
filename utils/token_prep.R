@@ -66,16 +66,14 @@ extract_bpe_sample_stream <- function(
       parsed_list <<- parsed_list_backup
     })
     
-    # 提取 text 字段
+    # 在提取 text 后的清洗步骤：
     texts <- vapply(parsed_list, function(x) {
-      if (is.list(x) && !is.null(x$text) && !is.na(x$text)) {
-        x$text 
-      } else {
-        ""
-      }
+      if (is.list(x) && !is.null(x$text) && !is.na(x$text)) x$text else ""
     }, character(1))
-    
+
     texts <- texts[texts != ""]
+
+    # 强制标点隔离
     punct_pattern <- "([,.:;!?\"'()\\{\\}\\[\\]，。！？；：—（）《》“”‘’、])"
     texts <- gsub(punct_pattern, " \\1 ", texts, perl = TRUE)
     texts <- gsub("\\s+", " ", texts, perl = TRUE)
