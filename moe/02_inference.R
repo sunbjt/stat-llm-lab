@@ -95,7 +95,7 @@ generate_moe_text <- function(model,
       return(invisible(current_ids))
     }
 
-    next_word <- tokenizer$decode(next_token_id)
+    next_word <- tokenizer$decode(next_token_id, clean = FALSE)
     if (next_word != "<EOS>") cat(next_word)
     flush.console()
 
@@ -121,7 +121,7 @@ generate_moe_text <- function(model,
         break
       }
 
-      next_word <- tokenizer$decode(next_token_id)
+      next_word <- tokenizer$decode(next_token_id, clean = FALSE)
       if (next_word == "<EOS>") break
 
       cat(next_word)
@@ -137,7 +137,7 @@ generate_moe_text <- function(model,
 # =====================================================================
 # 加载 checkpoint 并运行
 # =====================================================================
-ckpt_path <- "checkpoints/moe_model_03.pt"
+ckpt_path <- "checkpoints/moe_model_02.pt"
 checkpoint_data <- torch_load(ckpt_path, device = device)
 state <- if (!is.null(checkpoint_data$model)) checkpoint_data$model else checkpoint_data
 moe_model$load_state_dict(state)

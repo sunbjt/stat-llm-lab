@@ -30,46 +30,81 @@ TokenLatentModel <- nn_module(
     self$norm_f(h)
   },
 
-  forward = function(input_data) {
-    x_tokens <- input_data$x
-    y_tokens <- input_data$y
+ forward = function(input_data) {
+  x_tokens <- input_data$x
+  y_tokens <- input_data$y
 
-    B <- x_tokens$size(1); S <- x_tokens$size(2)
-    device <- x_tokens$device
+  B <- x_tokens$size(1)
+  S <- x_tokens$size(2)
 
-    h <- self$tok_emb(x_tokens)
-    for (i in 1:length(self$layers)) h <- self$layers[[i]](h)
-    h <- self$norm_f(h)
+  # --------------------------------------------------
+  # 1. Context encoder
+  # --------------------------------------------------
+  h <- self$tok_emb(x_tokens)
 
-    pred <- self$predictor(h)
-
-    # per-position contrastive: [S, B, B] — S positions, each with B negatives
-    target_emb <- self$tok_emb(y_tokens)$detach()
-
-    pred_norm <- nnf_normalize(pred, p = 2, dim = -1)
-    target_norm <- nnf_normalize(target_emb, p = 2, dim = -1)
-
-    pred_t <- pred_norm$transpose(1, 2)       # [S, B, D]
-    target_t <- target_norm$transpose(1, 2)   # [S, B, D]
-
-    sim <- torch_bmm(pred_t, target_t$transpose(2, 3)) / self$temperature  # [S, B, B]
-
-    labels <- torch_arange(1, B, dtype = torch_long(), device = device)$
-      unsqueeze(1)$expand(c(S, B))
-    contrastive_loss <- nnf_cross_entropy(
-      sim$reshape(c(S * B, B)),
-      labels$reshape(c(S * B))
-    )
-
-    # CE auxiliary loss (weight-tied with tok_emb)
-    ce_logits <- torch_matmul(h, self$tok_emb$weight$transpose(1, 2))
-    ce_loss <- nnf_cross_entropy(
-      ce_logits$reshape(c(B * S, -1)),
-      y_tokens$reshape(c(B * S))
-    )
-
-    list(loss = contrastive_loss + self$ce_weight * ce_loss,
-         contrastive = contrastive_loss,
-         ce = ce_loss)
+  for (i in 1:length(self$layers)) {
+    h <- self$layers[[i]](h)
   }
+
+  h <- self$norm_f(h)
+
+  # --------------------------------------------------
+  # 2. Predictor
+  # --------------------------------------------------
+  pred <- self$predictor(h)
+
+  # --------------------------------------------------
+  # 3. Target embedding
+  # --------------------------------------------------
+  target_emb <- self$tok_emb(y_tokens)$detach()
+
+  pred_norm <- nnf_normalize(pred, p = 2, dim = -1)
+  target_norm <- nnf_normalize(target_emb, p = 2, dim = -1)
+
+  # [B, S, D] -> [S, B, D]
+  pred_t <- pred_norm$permute(c(2, 1, 3))
+  target_t <- target_norm$permute(c(2, 1, 3))
+
+  # [S, B, D] x [S, D, B] -> [S, B, B]
+  sim <- torch_bmm(
+    pred_t,
+    target_t$transpose(2, 3)
+  ) / self$temperature
+
+  # 每个 position 的正样本都是 batch 中同 index
+  labels <- torch_arange(
+    1, B,
+    dtype = torch_long(),
+    device = x_tokens$device
+  )
+
+  labels <- labels$unsqueeze(1)$expand(c(S, B))
+
+  contrastive_loss <- nnf_cross_entropy(
+    sim$reshape(c(S * B, B)),
+    labels$reshape(c(S * B))
+  )
+
+  # --------------------------------------------------
+  # 4. Auxiliary CE
+  # --------------------------------------------------
+  ce_logits <- torch_matmul(
+    h,
+    self$tok_emb$weight$transpose(1, 2)
+  )
+
+  ce_loss <- nnf_cross_entropy(
+    ce_logits$reshape(c(B * S, -1)),
+    y_tokens$reshape(c(B * S))
+  )
+
+  total_loss <- contrastive_loss +
+    self$ce_weight * ce_loss
+
+  list(
+    loss = total_loss,
+    contrastive = contrastive_loss,
+    ce = ce_loss
+  )
+}
 )

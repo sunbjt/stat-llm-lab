@@ -88,7 +88,7 @@ generate_response <- function(model, tokenizer, prompt,
 
       if (next_token_id == eos_val) break
 
-      new_text <- tokenizer$decode(next_token_id)
+      new_text <- tokenizer$decode(next_token_id, clean = FALSE)
       if (new_text == "<EOS>") break
 
       cat(new_text)

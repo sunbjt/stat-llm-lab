@@ -1,8 +1,3 @@
-# =====================================================================
-# Token 潜语义推理 (Generate)
-# 预训练和 SFT 都可以推理，模型格式一样
-# =====================================================================
-
 Sys.setenv(PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True")
 
 source("config.R")
@@ -22,9 +17,9 @@ raw_model <- TokenLatentModel(
 device <- torch_device("cpu")
 raw_model <- raw_model$to(device = device)
 
-generate_text <- function(model, tokenizer, prompt, max_new_tokens = 50,
-                          temperature = 0.8, repetition_penalty = 1.2,
-                          top_k = 0, top_p = 0.9) {
+generate_text <- function(model, tokenizer, prompt, max_new_tokens = 100,
+                          temperature = 0.7, repetition_penalty = 1.2,
+                          top_k = 5, use_contrastive = TRUE) {
   device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
   model <- model$to(device = device)
   model$eval()
@@ -33,8 +28,6 @@ generate_text <- function(model, tokenizer, prompt, max_new_tokens = 50,
   current_ids <- c(tokenizer$bos_idx, raw_ids)
 
   cat(sprintf("\n[Input]: %s\n", prompt))
-  cat(sprintf("[Config]: Temp=%.2f, Penalty=%.2f, TopP=%.2f\n",
-              temperature, repetition_penalty, top_p))
   cat("[Generate]: ")
 
   with_no_grad({
@@ -45,58 +38,54 @@ generate_text <- function(model, tokenizer, prompt, max_new_tokens = 50,
 
       h <- model$encode(x_tensor)
 
-      pred_all <- model$predictor(h)
-      pred_last <- pred_all[, S, , drop = FALSE]$squeeze(1)
+      if (use_contrastive) {
+        # 对比学习 / 潜空间解构路径
+        pred_all <- model$predictor(h)
+        pred_last <- pred_all[, S, , drop = FALSE]$squeeze(1)
+        pred_norm <- nnf_normalize(pred_last, p = 2, dim = -1)
+        emb_norm <- nnf_normalize(model$tok_emb$weight, p = 2, dim = -1)
+        cos_sim <- torch_matmul(pred_norm, emb_norm$transpose(1, 2))$squeeze(1)
+        logits <- cos_sim / model$temperature
+      } else {
+        # 标准交叉熵 (CE) 路径
+        logits <- torch_matmul(h[, S, ], model$tok_emb$weight$transpose(1, 2))$squeeze(1)
+      }
 
-      pred_norm <- nnf_normalize(pred_last, p = 2, dim = -1)
-      emb_norm <- nnf_normalize(model$tok_emb$weight, p = 2, dim = -1)
-
-      cos_sim <- torch_matmul(pred_norm, emb_norm$transpose(1, 2))$squeeze(1)
-      logits <- cos_sim / model$temperature
-
-      # repetition penalty
+      # 1. Repetition Penalty
       if (repetition_penalty > 1.0) {
         uniq_ids <- unique(current_ids)
         idx_tensor <- torch_tensor(uniq_ids, dtype = torch_long(), device = device)
-        penalized <- logits[idx_tensor]
+        penalized <- logits[idx_tensor]$clone()
         mask_pos <- penalized > 0
         penalized[mask_pos] <- penalized[mask_pos] / repetition_penalty
         penalized[!mask_pos] <- penalized[!mask_pos] * repetition_penalty
         logits[idx_tensor] <- penalized
       }
 
-      # top-k
-      if (top_k > 0) {
-        topk <- torch_topk(logits, k = top_k, dim = -1)
-        mask <- torch_full_like(logits, -Inf)
-        mask$scatter_(1, topk[[2]], logits[topk[[2]]])
-        logits <- mask
+      # 2. Temperature Scaling
+      if (temperature > 1e-3) {
+        logits <- logits / temperature
       }
 
-      # temperature + top-p
+      # 3. Top-k Filtering (默认为 5)
+      if (top_k > 0 && top_k < logits$size(1)) {
+        topk <- torch_topk(logits, k = top_k)
+        min_val <- topk[[1]][top_k]$item()
+        logits[logits < min_val] <- -Inf
+      }
+
+      # 4. Sampling / Greedy Decoding
       if (temperature <= 1e-3) {
         next_token_id <- as.integer(torch_argmax(logits, dim = -1))
       } else {
-        logits <- logits / temperature
-        if (top_p < 1.0) {
-          sorted <- torch_sort(logits, descending = TRUE)
-          sorted_vals <- sorted[[1]]
-          cumsum <- torch_cumsum(nnf_softmax(sorted_vals, dim = -1), dim = -1)
-          cutoff <- sorted_vals$size(1) - as.integer(torch_sum(cumsum > top_p)) + 1
-          if (cutoff > 1) {
-            logits[logits < sorted_vals[cutoff]] <- -Inf
-          }
-        }
         probs <- nnf_softmax(logits, dim = -1)
         next_token_id <- as.integer(torch_multinomial(probs, num_samples = 1))
       }
 
-      if (!is.null(tokenizer$eos_idx) && next_token_id == tokenizer$eos_idx) {
-        cat(" [EOS]")
-        break
-      }
+      # EOS 判断与解码输出
+      if (!is.null(tokenizer$eos_idx) && next_token_id == tokenizer$eos_idx) break
 
-      next_word <- tokenizer$decode(next_token_id)
+      next_word <- tokenizer$decode(next_token_id, clean = FALSE)
       if (next_word == "<EOS>") break
 
       cat(next_word)
@@ -109,22 +98,11 @@ generate_text <- function(model, tokenizer, prompt, max_new_tokens = 50,
   invisible(current_ids)
 }
 
-# 根据 pre_train 和 SFT 选择模型文件：
 checkpoints_to_test <- c(
-  "checkpoints/contrastive_03.pt",
+  "checkpoints/contrastive_02.pt",
   "checkpoints/contrastive_sft_05.pt"
 )
 
-# 适合于预训练
-test_prompts <- c(
-  "我认为 AI 未来对人类有非常多的好处，理由如下",
-  "在大学里应该这样学习编程，首先",
-  "使用数据科学能够帮助企业提高生产效率，而且还能够",
-  "agent 技术最近发展非常迅速",
-  "学习深度学习的方法"
-)
-
-# 适合于 SFT 
 test_prompts <- c(
   "我认为 AI 未来对人类有哪些好处？",
   "在大学里应该这样学习编程？",
@@ -146,10 +124,11 @@ for (ckpt_path in checkpoints_to_test) {
       raw_model,
       tokenizer,
       prompt = prompt,
-      temperature = 0.1,
+      temperature = 0.3,
       repetition_penalty = 1.2,
-      top_p = 0.2,
-      max_new_tokens = 120
+      top_k = 5,
+      max_new_tokens = 120,
+      use_contrastive = TRUE
     )
   }
 }
@@ -205,7 +184,7 @@ generate_text_ce <- function(model, tokenizer, prompt, max_new_tokens = 80,
       }
 
       if (!is.null(tokenizer$eos_idx) && next_token_id == tokenizer$eos_idx) break
-      next_word <- tokenizer$decode(next_token_id)
+      next_word <- tokenizer$decode(next_token_id, clean = FALSE)
       if (next_word == "<EOS>") break
 
       cat(next_word)

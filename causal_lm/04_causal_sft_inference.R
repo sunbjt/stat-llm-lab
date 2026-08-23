@@ -91,7 +91,7 @@ generate_response <- function(model, tokenizer, prompt,
         break
       }
 
-      new_text <- tokenizer$decode(next_token_id)
+      new_text <- tokenizer$decode(next_token_id, clean = FALSE)
       if (new_text == "<EOS>") break
 
       # 流式打印到控制台

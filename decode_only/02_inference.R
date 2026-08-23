@@ -121,7 +121,7 @@ generate_causal_text <- function(model,
         break
       }
       
-      next_word <- tokenizer$decode(next_token_id)
+      next_word <- tokenizer$decode(next_token_id, clean = FALSE)
       if (next_word == "<EOS>") break
       
       cat(next_word)
@@ -135,7 +135,7 @@ generate_causal_text <- function(model,
 }
 
 # --- 运行测试 ---
-ckpt_path <- "checkpoints/decode_model_03.pt"
+ckpt_path <- "checkpoints/decode_model_02.pt"
 checkpoint_data <- torch_load(ckpt_path)
 state <- if (!is.null(checkpoint_data$model)) checkpoint_data$model else checkpoint_data
 causal_model$load_state_dict(state)

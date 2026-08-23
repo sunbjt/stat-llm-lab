@@ -11,14 +11,12 @@ source("latent_contrastive/contrastive_model.R")
 # --- 环境专属超参 (覆盖默认值) ---
 if (is_mac) {
   ENV_BATCH_SIZE       <- 2
-  ENV_MAX_LINES        <- 1000
   ENV_USE_AMP          <- FALSE
   ENV_ACCUM_STEPS      <- 1
 } else {
   ENV_BATCH_SIZE       <- 64
-  ENV_MAX_LINES        <- -1
   ENV_USE_AMP          <- cuda_is_available()
-  ENV_ACCUM_STEPS      <- 1   # 如果是 4 则等效于 ENV_BATCH_SIZE * 4
+  ENV_ACCUM_STEPS      <- 4   # 如果是 4 则等效于 ENV_BATCH_SIZE * 4
 }
 
 # =====================================================================
