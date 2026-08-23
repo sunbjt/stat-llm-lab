@@ -5,6 +5,7 @@ data/
 *.ipynb
 server/qa_data.jsonl
 *.log
+*.Rdata
 tidydata/concepts_translated.jsonl
 tidydata/corpus.jsonl
 tidydata/crawl_checkpoint.Rdata

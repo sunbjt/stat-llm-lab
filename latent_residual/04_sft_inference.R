@@ -90,20 +90,22 @@ generate_response <- function(model, tokenizer, prompt,
       probs <- nnf_softmax(logits, dim = -1)
       next_token_id <- as.integer(torch_multinomial(probs, num_samples = 1))
       
-      # 停止符判定
-      if (next_token_id == eos_val) break
+      if (!is.null(tokenizer$eos_idx) && next_token_id == tokenizer$eos_idx) {
+        break
+      }
       
-      new_text <- tokenizer$decode(next_token_id)
-      if (new_text == "<EOS>") break
+      # 1. 逐字打印时，关闭 clean 避免空格被吃掉或触发正则
+      next_word_raw <- tokenizer$decode(next_token_id, clean = FALSE)
+      if (next_word_raw == "<EOS>") break
       
-      cat(new_text)
+      cat(next_word_raw)
       flush.console()
       
       current_ids <- c(current_ids, next_token_id)
     }
   })
   
-  cat("\n--------------------------------------------------\n")
+  cat("[EOS]。\n")
   invisible(current_ids)
 }
 
@@ -113,11 +115,11 @@ generate_response <- function(model, tokenizer, prompt,
 torch_manual_seed(42) # 锁死随机种子，方便观察参数调整带来的影响
 
 test_prompts <- c(
-  "解释一下决策树算法",
+  "解释一下决策树原理。",
   "数据科学在企业有哪些直接的应用呢？",
-  "简单介绍一下交叉熵的基本原理。",
-  "人工智能能做什么",
-  "你是谁"
+  "简单介绍一下transformer的基本原理。",
+  "人工智能能做什么？",
+  "你是谁。"
 )
 
 

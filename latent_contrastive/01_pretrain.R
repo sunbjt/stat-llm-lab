@@ -121,7 +121,7 @@ optimizer <- optim_adamw(
 # 4. WSD 学习率调度
 # =====================================================================
 
-TRAIN_EPOCHS <- 3
+TRAIN_EPOCHS <- 2
 batches_per_epoch <- length(train_dl)
 accum_steps <- ENV_ACCUM_STEPS
 global_steps_per_epoch <- ceiling(batches_per_epoch / accum_steps)
