@@ -1,32 +1,15 @@
 source("utils/atomic_blocks.R")
 
 # =====================================================================
-# Pure Token 级潜语义对比模型 (Pure InfoNCE - Fixed R Keyword Error)
+# Token 级潜语义对比预训练 (Per-Position InfoNCE)
 # =====================================================================
-
 TokenLatentModel <- nn_module(
   "TokenLatentModel",
-
-  initialize = function(
-    vocab_size,
-    dim,
-    n_layers,
-    n_heads,
-    max_seq_len,
-    temperature = 0.07
-  ) {
+  initialize = function(vocab_size, dim, n_layers, n_heads, max_seq_len) {
     self$tok_emb <- nn_embedding(vocab_size, dim)
-
-    self$layers <- nn_module_list(
-      lapply(
-        1:n_layers,
-        function(i) RtomicBlock(dim, n_heads, max_seq_len)
-      )
-    )
-
+    self$layers <- nn_module_list(lapply(1:n_layers, function(i) RtomicBlock(dim, n_heads, max_seq_len)))
     self$norm_f <- RMSNorm(dim)
 
-    # 非线性 Predictor Projection
     self$predictor <- nn_sequential(
       nn_linear(dim, dim * 2),
       RMSNorm(dim * 2),
@@ -37,75 +20,56 @@ TokenLatentModel <- nn_module(
       nn_linear(dim, dim)
     )
 
-    self$temperature <- nn_buffer(torch_tensor(temperature))
+    self$temperature <- nn_buffer(torch_tensor(0.2))
+    self$ce_weight <- nn_buffer(torch_tensor(0.5))
   },
 
   encode = function(x_tokens) {
     h <- self$tok_emb(x_tokens)
-
-    for (i in 1:length(self$layers)) {
-      h <- self$layers[[i]](h)
-    }
-
+    for (i in 1:length(self$layers)) h <- self$layers[[i]](h)
     self$norm_f(h)
   },
 
   forward = function(input_data) {
-    x_tokens <- input_data$x  # [B, S]
-    y_tokens <- input_data$y  # [B, S]
+    x_tokens <- input_data$x
+    y_tokens <- input_data$y
 
-    B <- x_tokens$size(1)
-    S <- x_tokens$size(2)
+    B <- x_tokens$size(1); S <- x_tokens$size(2)
     device <- x_tokens$device
 
-    # 1. Online Encoder 提取特征
-    h <- self$encode(x_tokens)            # [B, S, D]
-    pred <- self$predictor(h)            # [B, S, D]
+    h <- self$tok_emb(x_tokens)
+    for (i in 1:length(self$layers)) h <- self$layers[[i]](h)
+    h <- self$norm_f(h)
 
-    # 2. Target Representation (解冻 Embedding，允许梯度更新)
-    target_emb <- self$tok_emb(y_tokens) # [B, S, D]
+    pred <- self$predictor(h)
 
-    # L2 正则化归一化
+    # per-position contrastive: [S, B, B] — S positions, each with B negatives
+    target_emb <- self$tok_emb(y_tokens)$detach()
+
     pred_norm <- nnf_normalize(pred, p = 2, dim = -1)
     target_norm <- nnf_normalize(target_emb, p = 2, dim = -1)
 
-    # [B, S, D] -> [S, B, D]
-    pred_t <- pred_norm$permute(c(2, 1, 3))     # [S, B, D]
-    target_t <- target_norm$permute(c(2, 1, 3)) # [S, B, D]
+    pred_t <- pred_norm$transpose(1, 2)       # [S, B, D]
+    target_t <- target_norm$transpose(1, 2)   # [S, B, D]
 
-    # [S, B, D] x [S, D, B] -> [S, B, B] 余弦相似度矩阵
-    sim <- torch_bmm(pred_t, target_t$transpose(2, 3)) / self$temperature
+    sim <- torch_bmm(pred_t, target_t$transpose(2, 3)) / self$temperature  # [S, B, B]
 
-    # ---------------------------------------------------------------
-    # 3. 消除 False Negatives (平滑 Mask 机制)
-    # ---------------------------------------------------------------
-    y_t <- y_tokens$transpose(1, 2) # [S, B]
-    same_token_mask <- (y_t$unsqueeze(3) == y_t$unsqueeze(2)) # [S, B, B]
-    
-    diag_mask <- torch_eye(B, dtype = torch_bool(), device = device)$unsqueeze(1)$expand(c(S, B, B))
-    false_negative_mask <- same_token_mask & (!diag_mask)
-
-    # 填入 -100.0 防止 Softmax 极小值数值溢出与梯度暴胀
-    sim$masked_fill_(false_negative_mask, -100.0)
-
-    # ---------------------------------------------------------------
-    # 4. 正确对齐 1-based 标签与展平形状
-    # ---------------------------------------------------------------
-    # 基础标签 [B]: 1, 2, ..., B
-    labels_per_seq <- torch_arange(1, B, dtype = torch_long(), device = device)
-
-    # 关键修复：使用 `repeat` 避开 R 保留字语法解析错误
-    labels <- labels_per_seq$`repeat`(c(S))
-
-    # 展平相似度矩阵 [S * B, B]
-    sim_flat <- sim$reshape(c(S * B, B))
-
-    # 计算全局单节点平均 Cross Entropy Loss
-    contrastive_loss <- nnf_cross_entropy(sim_flat, labels)
-
-    list(
-      loss = contrastive_loss,
-      contrastive = contrastive_loss
+    labels <- torch_arange(1, B, dtype = torch_long(), device = device)$
+      unsqueeze(1)$expand(c(S, B))
+    contrastive_loss <- nnf_cross_entropy(
+      sim$reshape(c(S * B, B)),
+      labels$reshape(c(S * B))
     )
+
+    # CE auxiliary loss (weight-tied with tok_emb)
+    ce_logits <- torch_matmul(h, self$tok_emb$weight$transpose(1, 2))
+    ce_loss <- nnf_cross_entropy(
+      ce_logits$reshape(c(B * S, -1)),
+      y_tokens$reshape(c(B * S))
+    )
+
+    list(loss = contrastive_loss + self$ce_weight * ce_loss,
+         contrastive = contrastive_loss,
+         ce = ce_loss)
   }
 )

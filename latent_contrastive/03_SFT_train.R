@@ -72,7 +72,7 @@ GenerativeSFTDataset <- dataset(
 # =====================================================================
 # 3. 加载预训练权重
 # =====================================================================
-PRETRAIN_CKPT <- "checkpoints/contrastive_02.pt"
+PRETRAIN_CKPT <- "checkpoints/contrastive_03.pt"
 if (file.exists(PRETRAIN_CKPT)) {
   cat(sprintf("加载预训练底座权重: %s\n", PRETRAIN_CKPT))
   ckpt <- torch_load(PRETRAIN_CKPT)
