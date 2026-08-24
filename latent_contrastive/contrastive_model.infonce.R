@@ -1,20 +1,7 @@
 source("utils/atomic_blocks.R")
 
 # =====================================================================
-# Token 级潜语义对比预训练 (Pure Per-Position InfoNCE)
-# =====================================================================
-#
-# 目标：
-#   x_t -> Online Encoder -> Predictor -> z_pred
-#   y_t -> Target Token Embedding (stop-gradient) -> z_target
-#   通过同一 position 的 batch 内样本进行 InfoNCE
-#
-# Loss：
-#   L = L_InfoNCE
-#
-# 注意：
-#   target embedding 使用 detach()，因此 target branch 不接收
-#   InfoNCE 的反向梯度；这是当前模型设计的一部分。
+# Pure Token 级潜语义对比模型 (Pure InfoNCE with Masked Negatives)
 # =====================================================================
 
 TokenLatentModel <- nn_module(
@@ -26,7 +13,7 @@ TokenLatentModel <- nn_module(
     n_layers,
     n_heads,
     max_seq_len,
-    temperature = 0.2
+    temperature = 0.07
   ) {
     self$tok_emb <- nn_embedding(vocab_size, dim)
 
@@ -39,6 +26,7 @@ TokenLatentModel <- nn_module(
 
     self$norm_f <- RMSNorm(dim)
 
+    # 非线性 Predictor Projection
     self$predictor <- nn_sequential(
       nn_linear(dim, dim * 2),
       RMSNorm(dim * 2),
@@ -49,10 +37,7 @@ TokenLatentModel <- nn_module(
       nn_linear(dim, dim)
     )
 
-    # Fixed temperature: saved in state_dict, not optimized.
-    self$temperature <- nn_buffer(
-      torch_tensor(temperature)
-    )
+    self$temperature <- nn_buffer(torch_tensor(temperature))
   },
 
   encode = function(x_tokens) {
@@ -73,30 +58,14 @@ TokenLatentModel <- nn_module(
     S <- x_tokens$size(2)
     device <- x_tokens$device
 
-    # ---------------------------------------------------------------
-    # 1. Online encoder
-    # ---------------------------------------------------------------
-    h <- self$tok_emb(x_tokens)
+    # 1. Online Encoder 提取特征
+    h <- self$encode(x_tokens)   # [B, S, D]
+    pred <- self$predictor(h)   # [B, S, D]
 
-    for (i in 1:length(self$layers)) {
-      h <- self$layers[[i]](h)
-    }
+    # 2. Target Representation (解冻 Embedding，允许双向优化)
+    target_emb <- self$tok_emb(y_tokens) # [B, S, D]
 
-    h <- self$norm_f(h)
-
-    # ---------------------------------------------------------------
-    # 2. Predictor
-    # ---------------------------------------------------------------
-    pred <- self$predictor(h)
-
-    # ---------------------------------------------------------------
-    # 3. Target representation
-    # ---------------------------------------------------------------
-    # [B, S] -> [B, S, D]
-    # Stop gradient on target branch.
-    target_emb <- self$tok_emb(y_tokens)$detach()
-
-    # L2 normalize latent vectors.
+    # L2 正则化归一化
     pred_norm <- nnf_normalize(pred, p = 2, dim = -1)
     target_norm <- nnf_normalize(target_emb, p = 2, dim = -1)
 
@@ -104,39 +73,32 @@ TokenLatentModel <- nn_module(
     pred_t <- pred_norm$permute(c(2, 1, 3))
     target_t <- target_norm$permute(c(2, 1, 3))
 
-    # For every sequence position:
-    #
-    #   [B, D] x [D, B] -> [B, B]
-    #
-    # Combined over S positions:
-    #
-    #   [S, B, D] x [S, D, B] -> [S, B, B]
-    #
-    # Diagonal = positive pairs.
-    sim <- torch_bmm(
-      pred_t,
-      target_t$transpose(2, 3)
-    ) / self$temperature
+    # [S, B, D] x [S, D, B] -> [S, B, B] 余弦相似度矩阵
+    sim <- torch_bmm(pred_t, target_t$transpose(2, 3)) / self$temperature
 
-    # Positive target for sample i is target i.
-    labels <- torch_arange(
-      1,
-      B,
-      dtype = torch_long(),
-      device = device
-    )
+    # ---------------------------------------------------------------
+    # 核心修复：消除 False Negatives (伪负样本 Mask)
+    # ---------------------------------------------------------------
+    y_t <- y_tokens$transpose(1, 2)
+    
+    # 检查同一位置上，哪些 Batch 样本的目标 Token 实际上相同
+    same_token_mask <- y_t$unsqueeze(3) == y_t$unsqueeze(2)
 
-    labels <- labels$
-      unsqueeze(1)$
-      expand(c(S, B))
+    # 排除对角线（正样本 Positive Pair 不遮罩）
+    diag_mask <- torch_eye(B, dtype = torch_bool(), device = device)$unsqueeze(1)$expand(c(S, B, B))
+    false_negative_mask <- same_token_mask & (!diag_mask)
 
-    # [S, B, B] -> [S*B, B]
+    # 将伪负样本处的相似度设为 -1e9，使其在 Softmax 中归零
+    sim$masked_fill_(false_negative_mask, -1e9)
+
+    # 3. 计算纯粹的 Pure InfoNCE Loss
+    labels <- torch_arange(1, B, dtype = torch_long(), device = device)$unsqueeze(1)$expand(c(S, B))
+
     contrastive_loss <- nnf_cross_entropy(
       sim$reshape(c(S * B, B)),
       labels$reshape(c(S * B))
     )
 
-    # Pure InfoNCE objective.
     list(
       loss = contrastive_loss,
       contrastive = contrastive_loss
