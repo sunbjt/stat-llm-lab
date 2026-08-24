@@ -136,3 +136,10 @@ close(con_out)
 cat(sprintf("\n初始文档: %d 篇 | 放行文档: %d 篇\n黄金语料已写出至: %s\n",
             total_docs, total_written, output_path))
 
+# 如果需要打乱，直接借助系统命令来做
+if(FALSE){
+  cat(sprintf("\n[%s] 调用系统外存工具打乱语料...\n", Sys.time()))
+  shuf_cmd <- sprintf("shuf %s -o %s", shQuote(output_path), shQuote(output_path))
+  system(shuf_cmd)
+  cat(sprintf("[%s] 全局打乱完成！\n", Sys.time()))
+}

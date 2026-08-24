@@ -37,25 +37,19 @@ generate_text <- function(model, tokenizer, prompt, max_new_tokens = 50,
       
       h <- model$tok_emb(x_tensor)
       
-      # 遍历 Transformer 层
       for (j in 1:length(model$layers)) {
         h <- model$layers[[j]](h)
       }
       
       h <- model$norm_f(h)
-      
-      # 严格对齐前向传播的残差逻辑 (h + predictor)
       semantic_delta <- model$predictor(h)
       pred <- h + semantic_delta
       
-      # 提取最后一个 Token 的特征向量 (B, Dim)
       last_pred <- pred[, seq_len, ]
-      
-      # 与最新训练状态对齐，移除球面归一化，直接计算内积并引入 Temperature
       logits <- torch_matmul(last_pred, model$tok_emb$weight$t()) / temperature
       logits <- logits$squeeze(1)
       
-      # 3. 施加重复惩罚 (Repetition Penalty)
+      # 重复惩罚
       unique_past_ids <- unique(current_ids)
       for (past_id in unique_past_ids) {
         logit_val <- as.numeric(logits[past_id])
@@ -66,36 +60,33 @@ generate_text <- function(model, tokenizer, prompt, max_new_tokens = 50,
         }
       }
       
-      # 4. Top-K 截断过滤长尾噪音
+      # Top-K
       if (top_k > 0) {
         topk_res <- torch_topk(logits, k = top_k)
         kth_value <- topk_res[[1]][top_k]
         logits <- torch_where(logits < kth_value, torch_tensor(-Inf, device = device), logits)
       }
       
-      # 5. 概率采样
+      # 采样
       probs <- nnf_softmax(logits, dim = -1)
       next_token_id <- as.integer(torch_multinomial(probs, num_samples = 1))
       
-      # 检测停止符
       if (!is.null(tokenizer$eos_idx) && next_token_id == tokenizer$eos_idx) {
-        cat(" [EOS]")
         break
       }
       
-      next_word <- tokenizer$decode(next_token_id)
-      if (next_word == "<EOS>") {
-        cat(" [EOS]")
-        break
-      }
+      # 1. 逐字打印时，关闭 clean 避免空格被吃掉或触发正则
+      next_word_raw <- tokenizer$decode(next_token_id, clean = FALSE)
+      if (next_word_raw == "<EOS>") break
       
-      cat(next_word)
+      cat(next_word_raw)
       flush.console()
       
       current_ids <- c(current_ids, next_token_id)
     }
   })
-  cat("\n\n生成完毕。\n")
+  
+  cat("[EOS]。\n")
   invisible(current_ids)
 }
 

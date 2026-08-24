@@ -9,7 +9,7 @@ tokenizer <- RtomicBPETokenizer$new(model_file = BPE_MODEL_FILE, vocab_size = VO
 device <- torch_device("cpu")
 
 # 1. 彻底抛弃 Generator/Decoder，直接加载裸的 JEPA 基座
-JEPA_CKPT <- "checkpoints/wm_03.pt" # 如果你跑完了 3 个 Epoch，请改成 wm_03.pt
+JEPA_CKPT <- "checkpoints/wm_02.pt" # 如果你跑完了 3 个 Epoch，请改成 wm_03.pt
 
 model <- RtomicJEPA_VQ(
   vocab_size = VOCAB_SIZE, dim = DIM, n_layers = N_LAYERS, 
@@ -76,7 +76,7 @@ generate_text <- function(model, tokenizer, prompt, max_new_tokens = 50, tempera
         break
       }
       
-      next_word <- tokenizer$decode(next_token_id)
+      next_word <- tokenizer$decode(next_token_id, clean = FALSE)
       cat(next_word)
       flush.console()
       

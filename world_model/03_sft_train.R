@@ -5,7 +5,7 @@
 source("config.R")
 
 # --- 环境专属超参 ---
-BATCH_SIZE <- if (is_mac) 4 else 64
+BATCH_SIZE <- if (is_mac) 4 else 32
 
 device <- torch_device(if(cuda_is_available()) "cuda" else "cpu")
 cat(sprintf("当前运行设备: %s\n", device$type))
@@ -25,7 +25,7 @@ model <- RtomicJEPA_VQ(
 # =====================================================================
 # 2. 加载预训练 JEPA 权重 (处理 luz 的 model. 前缀)
 # =====================================================================
-PRETRAIN_CKPT <- "checkpoints/wm_03.pt"
+PRETRAIN_CKPT <- "checkpoints/wm_02.pt"
 cat(sprintf("正在加载 JEPA 预训练权重: %s\n", PRETRAIN_CKPT))
 ckpt <- torch_load(PRETRAIN_CKPT, device = "cpu")
 clean_state_dict <- list()

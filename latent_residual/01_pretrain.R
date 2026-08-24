@@ -26,13 +26,11 @@ source("latent_residual/LRP_model.R")
 tokenizer <- RtomicBPETokenizer$new(model_file = BPE_MODEL_FILE, vocab_size = VOCAB_SIZE)
 
 # =====================================================================
-# 完美对齐版 Dataloader (替换原有的 RtomicBinDataset)
+# 完美对齐版 Dataloader
 # =====================================================================
 RtomicBinDataset <- dataset(
   name = "RtomicBinDataset",
-  
   initialize = function(bin_file, seq_len = 256, vocab_size = 16384, bytes_per_token = 2) {
-    self$bin_file <- bin_file
     self$seq_len <- seq_len
     self$vocab_size <- vocab_size
     self$bytes_per_token <- bytes_per_token
@@ -41,35 +39,32 @@ RtomicBinDataset <- dataset(
     total_bytes <- file_info$size
     total_tokens <- total_bytes / bytes_per_token
     
-    # 【核心改变 1】：精准切块。因为数据已完美对齐，不需要再强行多读 1 个 Token
-    self$chunk_size <- seq_len 
-    self$num_batches <- floor(total_tokens / self$chunk_size)
+    # 1. 一次性将整个二进制文件读入 RAM (RAW 字节向量)
+    self$raw_data <- readBin(bin_file, what = "raw", n = file.info(bin_file)$size)
     
+    # 转换为 integer 向量（或利用 int32 / int16 内存映射）
+    self$tokens <- readBin(self$raw_data, what = "integer", n = length(self$raw_data) / bytes_per_token, 
+                           size = bytes_per_token, signed = FALSE, endian = "little")
+    
+    self$num_batches <- floor(length(self$tokens) / seq_len)
     cat(sprintf("物理总 Token 数: %.2f M\n", total_tokens / 1e6))
     cat(sprintf("按 SEQ_LEN = %d 极速读取，总计生成 %d 个纯净训练块\n", 
-                seq_len, self$num_batches))
+                seq_len, self$num_batches))    
   },
   
   .getitem = function(i) {
-    # 严格计算底层字节偏移量
-    start_token <- (i - 1) * self$chunk_size
-    offset_bytes <- start_token * self$bytes_per_token
+    start_idx <- (i - 1) * self$seq_len + 1
+    end_idx <- start_idx + self$seq_len - 1
     
-    con <- file(self$bin_file, "rb")
-    seek(con, where = offset_bytes, origin = "start")
-    chunk <- readBin(con, what = "integer", n = self$chunk_size, 
-                     size = self$bytes_per_token, signed = FALSE, endian = "little")
-    close(con)
+    # 直接在内存数组中切片，绝无磁盘 IO 开销！
+    chunk <- self$tokens[start_idx:end_idx]
     
-    # x 取第 1 到倒数第 2 个 Token
     x_ids <- chunk[1:(self$seq_len - 1)]
-    # y 取第 2 到最后一个 Token
     y_ids <- chunk[2:self$seq_len]
     
-    x <- torch_tensor(x_ids, dtype = torch_long())
-    y <- torch_tensor(y_ids, dtype = torch_long())
-    
-    list(x = list(x = x, y = y), y = y)
+    list(x = list(x = torch_tensor(x_ids, dtype = torch_long()), 
+                  y = torch_tensor(y_ids, dtype = torch_long())), 
+         y = torch_tensor(y_ids, dtype = torch_long()))
   },
   
   .length = function() {
@@ -190,7 +185,7 @@ luz_callback_clip_grad <- luz_callback(
 )
 
 # 建立全局训练轮数（单一事实来源）
-TRAIN_EPOCHS <- 3
+TRAIN_EPOCHS <- 2
 total_steps <- TRAIN_EPOCHS * length(train_dl)
 
 base_callbacks <- list(

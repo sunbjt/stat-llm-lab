@@ -18,7 +18,7 @@ if (is_mac) {
   ENV_USE_AMP     <- FALSE
   
 } else {
-  ENV_BATCH_SIZE  <- 64
+  ENV_BATCH_SIZE  <- 32
   ENV_GRAD_ACCUM  <- 4   # 如果 = 4，Batch Size = 64，则相当于 256
   ENV_USE_AMP     <- TRUE
 }
@@ -123,7 +123,7 @@ wsd_multiplier <- function(step, total_steps, warmup_pct = 0.1, decay_pct = 0.1)
   return(max(0.1, cosine_decay))
 }
 
-TRAIN_EPOCHS <- 3
+TRAIN_EPOCHS <- 2
 total_steps <- (TRAIN_EPOCHS * length(train_dl)) / ENV_GRAD_ACCUM
 cat("\n总训练步数：", total_steps, "\n")
 

@@ -11,7 +11,7 @@ if (is_mac) {
   ENV_USE_AMP     <- FALSE
   ENV_WORKERS     <- 0
 } else {
-  ENV_BATCH_SIZE  <- 128
+  ENV_BATCH_SIZE  <- 64
   ENV_MAX_LINES   <- -1
   ENV_USE_AMP     <- TRUE
   ENV_WORKERS     <- 2
@@ -176,7 +176,7 @@ luz_callback_ema_update <- luz_callback(
   }
 )
 
-TRAIN_EPOCHS <- 3
+TRAIN_EPOCHS <- 2
 total_steps <- TRAIN_EPOCHS * length(train_dl)
 
 base_callbacks <- list(

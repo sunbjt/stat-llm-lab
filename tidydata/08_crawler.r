@@ -205,12 +205,13 @@ crawl_topic <- function(seed,
 # 1 种子页面上找到的链接
 # 2 第 1 层链接页面上找到的链接 
 relations <- crawl_topic(
-  seed             = "Data_mining",
+#  seed             = "Data_mining",
+  seed             = "China",
   max_depth        = 2,
   min_sleep        = 3,
   max_sleep        = 6,
-  max_pages        = 1000,
-  checkpoint_file  = "crawl_checkpoint.Rdata",
+  max_pages        = 2000,
+  checkpoint_file  = "China_crawl_checkpoint.Rdata",
   checkpoint_every = 20
 )
 
@@ -219,7 +220,7 @@ relations <- crawl_topic(
 ## relations <- rbind(relations, relations_ml) %>% unique()
 
 # 保存最终结果
-# save(relations, file = "relations.Rdata")
+# save(relations, file = "China_relations.Rdata")
 
 ## 二次安全过滤（should_filter 在爬取时已过滤大部分，此处兜底）
 yes_left <- as.character(relations$topic_left) %>%

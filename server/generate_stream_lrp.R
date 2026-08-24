@@ -90,7 +90,7 @@ generate_lrp_text_async <- function(model, tokenizer, prompt,
     
     # 8. 执行 WebSocket 回调
     if (!is.null(on_token)) {
-      token_text <- tokenizer$decode(list(next_token))
+      token_text <- tokenizer$decode(list(next_token), clean = FALSE)
       
       ## 首 Token 幽灵标点拦截（针对第一个可见 token，而非 step==0）
       if (state$first_visible) {
