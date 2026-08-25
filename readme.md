@@ -29,7 +29,7 @@
 - MoE Causal LM 共享 + 路由专家的非对称设计生效了。多专家机制提供了更大的有效参数容量，在处理复杂符号模式（symbol_pattern）和指代消解（coreference）等需要多步上下文归纳的任务上优势明显。
 - 对比学习 (Contrastive) 的 InfoNCE 强制让模型在连续特征空间拉开正负样本距离，显著增强了空间中的逻辑判别力（三段论 syllogism 和条件句 conditional 的极佳表现印证了这一点）
 - JEPA VQ Codebook（密码本）机制将高维特征强制离散化到 4096 个聚类中心，起到了极强的规范与约束效果（约束满足 constraints 测试表现突出）
-- 潜在空间残差预测通过构造显式预测语义增量（$\Delta H$）使潜空间连续性更佳。它不擅长做硬逻辑推理，但在知识记忆（general_knowledge）和抵御干扰/攻击（instruction_attack/distractor）方面展现出了不错的鲁棒性。
+- 潜在空间残差预测通过构造显式预测语义增量（ $\Delta H$ ）使潜空间连续性更佳。它不擅长做硬逻辑推理，但在知识记忆（general_knowledge）和抵御干扰/攻击（instruction_attack/distractor）方面展现出了不错的鲁棒性。
 - Causal LM 作为稳健基准，无突出短线
 
 ---
