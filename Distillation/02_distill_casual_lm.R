@@ -5,7 +5,6 @@ Sys.setenv(PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True")
 if (basename(normalizePath(getwd())) == "Distillation") setwd("..")
 
 library(torch)
-library(luz)
 library(arrow)
 
 source("config.R")
@@ -19,6 +18,9 @@ if (is_mac) {
   ENV_BATCH_SIZE  <- 64  # 15M 小模型显存开销极小，RTX 3090 可轻松开启 32~64
   ENV_USE_AMP     <- TRUE
 }
+
+# 梯度累加系数：有效 batch = ENV_BATCH_SIZE × 系数（服务器 64 × 2 = 128）
+ENV_GRAD_ACCUM <- 2L
 
 # =====================================================================
 # 2. 零 CPU 耗时内存 Dataset
@@ -268,6 +270,7 @@ RtomicBinDataset <- dataset(
     self$mode <- "ram"
 
     total_bytes <- self$stride * self$n_samples
+    self$total_bytes <- total_bytes   # 供调用方决定 num_workers（luz/callr 会序列化拷贝整个数据集）
     ram <- detect_ram_bytes()
     cap <- if (is.na(ram)) 8e9 else ram * ram_frac
     gb  <- function(b) sprintf("%.1f GB", b / 1e9)
@@ -277,7 +280,7 @@ RtomicBinDataset <- dataset(
       self$raw <- readBin(con, what = "raw", n = total_bytes)
       close(con)
       message(sprintf(
-        "【RAM 模式】%d 条 × %d 字节/条 = %s ≤ 内存上限 %s：全量载入内存，切片随机访问、可开多 worker（num_workers>0）。",
+        "【RAM 模式】%d 条 × %d 字节/条 = %s ≤ 内存上限 %s：全量载入内存，切片随机访问、无读盘卡顿。\n  num_workers 由调用方按 total_bytes 决定：数据跨进程会被序列化复制，大 bin 必须保持 0。",
         self$n_samples, self$stride, gb(total_bytes), gb(cap)
       ))
     } else {
@@ -345,12 +348,21 @@ if (file.exists(BIN_FILE) && file.exists(BIN_META)) {
     meta_file  = BIN_META,
     target_len = TARGET_LEN
   )
+  # luz/torch 的 num_workers>0 用 callr 启动子进程：把【整个数据集对象】saveRDS
+  # 序列化到临时文件、每个 worker 再各自 load 一份完整拷贝。RAM 模式下 self$raw 就是
+  # 整个 bin（十几 GB）：开 worker 会写一份十几 GB 临时文件 + 每个 worker 再吃十几 GB
+  # 内存 —— 正是刚才服务器上 "error writing to connection" / 系统盘被打满的根因。
+  # 因此只有数据足够小、拷贝几份可承受时才开 worker；否则保持 0
+  # （RAM 模式本身已消除读盘卡顿，num_workers=0 不影响该收益）。
+  MAX_SERIALIZE_BYTES <- 2e9   # bin ≤ 2GB 时序列化拷贝可承受
+  n_workers <- if (identical(train_dataset$mode, "ram") &&
+                   train_dataset$total_bytes <= MAX_SERIALIZE_BYTES) 4L else 0L
   train_dl <- dataloader(
     train_dataset,
     batch_size  = ENV_BATCH_SIZE,
     shuffle     = TRUE,    # bin 为 O(1) 随机访问，可全局洗牌
     drop_last   = TRUE,
-    num_workers = if (identical(train_dataset$mode, "ram")) 4L else 0L,
+    num_workers = n_workers,
     pin_memory  = !is_mac
   )
 } else {
@@ -397,8 +409,10 @@ distill_loss_fn <- function(temperature = 1.0, alpha = 0.8) {
     # -------------------------------------------------------------------
     t_topk_ids_long <- t_topk_ids$to(device = dev, dtype = torch_long())
 
-    # 检查索引是否超出范围 [0, vocab_size - 1]
-    invalid_mask <- (t_topk_ids_long < 0L) | (t_topk_ids_long >= vocab_size)
+    # 检查索引是否超出范围。真实投影数据是 1-based surface id（∈ [1, 16383]，
+    # PAD=1/UNK=2，见 01_ts_span_align.py）；<=0 与 >=vocab 一律视为非法：
+    # 0-based 数据、越界 id 都被替换为 1L（概率同步置 0，对 KL 零贡献）。
+    invalid_mask <- (t_topk_ids_long <= 0L) | (t_topk_ids_long >= vocab_size)
 
     # 替换非法索引为 1L：R torch 的 torch_gather 强制 1-based 索引，
     # 索引 0 会直接报错 "Indexing starts at 1 but found a 0"。
@@ -471,96 +485,219 @@ distill_loss_fn <- function(temperature = 1.0, alpha = 0.8) {
 
     ce_loss     <- nnf_cross_entropy(logits_flat[mask_flat, ], y_flat[mask_flat])
 
-    alpha * kl_loss + (1 - alpha) * ce_loss
+    total <- alpha * kl_loss + (1 - alpha) * ce_loss
+    list(total = total, kl = kl_loss, ce = ce_loss)
   }
 }
 
 # =====================================================================
-# 4. 优化器与 WSD 学习率调度器
+# 4. 原生手写训练循环
+#    luz 的 fit() 封装固定每 batch step + zero_grad，且 loss 只能返回单张量：
+#    —— KL/CE 无法分开观测、无法梯度累加。改为手写循环后两者都可控。
 # =====================================================================
-custom_grouped_optim <- function(params, lr = 5e-4, weight_decay = 0.05, ...) {
-  emb_names <- grep("^tok_emb|^pos_emb|^lm_head", names(params), value = TRUE)
-  other_names <- setdiff(names(params), emb_names)
-  grouped_params <- list(
-    list(params = params[emb_names], lr = lr * 0.5),
-    list(params = params[other_names], lr = lr)
-  )
-  optim_adamw(grouped_params, weight_decay = weight_decay, ...)
-}
-
-wsd_multiplier <- function(step, total_steps, warmup_pct = 0.05, decay_pct = 0.15) {
-  current_step <- as.numeric(step) + 1
-  total_steps  <- as.numeric(total_steps)
-
-  warmup_steps <- total_steps * warmup_pct
-  decay_steps  <- total_steps * decay_pct
-  stable_steps <- total_steps - warmup_steps - decay_steps
-
-  if (current_step <= warmup_steps) {
-    return(current_step / warmup_steps)
-  } else if (current_step <= warmup_steps + stable_steps) {
-    return(1.0)
-  } else {
-    decay_step   <- current_step - (warmup_steps + stable_steps)
-    progress     <- decay_step / decay_steps
-    cosine_decay <- 0.5 * (1 + cos(pi * progress))
-    return(max(0.1, cosine_decay))
-  }
-}
-
 DISTILL_EPOCHS <- 3
-total_steps    <- DISTILL_EPOCHS * length(train_dl)
+BASE_LR        <- 3e-4
+WEIGHT_DECAY   <- 0.05
+ALPHA          <- 0.8
+TEMPERATURE    <- 1.0
+GRAD_CLIP      <- 1.0
 
-luz_callback_clip_grad <- luz_callback(
-  "clip_grad",
-  initialize = function(max_norm = 1.0) {
-    self$max_norm <- max_norm
-  },
-  on_backward_end = function() {
-    torch::nn_utils_clip_grad_norm_(ctx$model$parameters, max_norm = self$max_norm)
-  }
-)
+accum_steps <- as.integer(ENV_GRAD_ACCUM)   # 梯度累加系数（env 块定义，服务器 = 2）
 
-base_callbacks <- list(
-  luz_callback_lr_scheduler(
-    torch::lr_lambda,
-    lr_lambda = function(step) {
-      wsd_multiplier(step, total_steps = total_steps, warmup_pct = 0.05, decay_pct = 0.15)
-    },
-    call_on = "on_train_batch_end"
-  ),
-  luz_callback_clip_grad(1.0),
-  luz_callback_model_checkpoint(
-    path = "checkpoints/distill_model_{epoch:02d}.pt",
-    save_best_only = FALSE,
-    monitor = "train_loss"
-  )
-)
+dir.create("checkpoints", showWarnings = FALSE, recursive = TRUE)
 
-if (ENV_USE_AMP && cuda_is_available()) {
-  base_callbacks <- append(base_callbacks, list(luz_callback_mixed_precision()))
+# ---- 设备自推导（config.R 的 device 是字符串，这里转 torch_device；MPS 不支持 non_blocking）----
+device <- torch_device(if (is_mac) "mps" else if (cuda_is_available()) "cuda" else "cpu")
+nb      <- device$type == "cuda"
+use_amp <- isTRUE(ENV_USE_AMP) && device$type == "cuda"
+
+# ---- batch 数与 WSD 总优化步数 ----
+n_batches <- length(train_dl)   # 实测可靠返回 drop_last 后的 batch 数
+if (is.na(n_batches) || n_batches < 1) {
+  n_batches <- length(train_dataset) %/% ENV_BATCH_SIZE
+}
+if (n_batches < 1) stop("训练 batch 数为 0，请检查数据")
+steps_per_epoch   <- ceiling(n_batches / accum_steps)
+total_optim_steps <- DISTILL_EPOCHS * steps_per_epoch
+
+# ---- WSD（warmup_pct=0.05, decay_pct=0.15, 余弦衰减地板 0.1）----
+wsd_multiplier <- function(step, total_steps, warmup_pct = 0.05, decay_pct = 0.15) {
+  current      <- as.numeric(step)
+  total_steps  <- as.numeric(total_steps)
+  warmup_steps <- max(1, round(total_steps * warmup_pct))
+  decay_steps  <- max(1, round(total_steps * decay_pct))
+  stable_steps <- max(1, total_steps - warmup_steps - decay_steps)
+
+  if (current <= 0) return(0.0)
+  if (current <= warmup_steps) return(current / warmup_steps)
+  if (current <= warmup_steps + stable_steps) return(1.0)
+  decay_step <- current - (warmup_steps + stable_steps)
+  progress   <- min(1.0, decay_step / decay_steps)
+  max(0.1, 0.5 * (1 + cos(pi * progress)))
 }
 
-cat(sprintf("\n[%s] 启动 15M 学生模型从头蒸馏训练 (Total Steps: %d)...\n",
-            format(Sys.time(), "%H:%M:%S"), total_steps))
+# ---- 模型 ----
+model <- RtomicCausalLM(
+  vocab_size  = VOCAB_SIZE,
+  dim         = DIM,
+  n_layers    = N_LAYERS,
+  n_heads     = N_HEADS,
+  max_seq_len = SEQ_LEN
+)$to(device = device)
 
-fitted_distill_lm <- RtomicCausalLM |>
-  setup(
-    loss = distill_loss_fn(temperature = 1.0, alpha = 0.8),
-    optimizer = custom_grouped_optim
-  ) |>
-  set_hparams(
-    vocab_size = VOCAB_SIZE,
-    dim = DIM,
-    n_layers = N_LAYERS,
-    n_heads = N_HEADS,
-    max_seq_len = SEQ_LEN
-  ) |>
-  set_opt_hparams(lr = 3e-4, weight_decay = 0.05) |>
-  fit(
-    data = train_dl,
-    epochs = DISTILL_EPOCHS,
-    accelerator = accelerator(),
-    callbacks = base_callbacks,
-    verbose = TRUE
+# ---- 分组优化器：emb 组 LR×0.5、其余全 LR（与旧 custom_grouped_optim 一致）----
+param_names <- names(model$parameters)
+emb_names   <- grep("^tok_emb", param_names, value = TRUE)
+other_names <- setdiff(param_names, emb_names)
+all_params  <- model$parameters
+grouped_params <- list(
+  list(params = all_params[emb_names],   lr = BASE_LR * 0.5),
+  list(params = all_params[other_names], lr = BASE_LR)
+)
+optimizer <- optim_adamw(grouped_params, lr = BASE_LR, weight_decay = WEIGHT_DECAY)
+# param_groups 无 initial_lr 字段，WSD 分组写回需自己按组存 base lr
+group_base_lrs <- vapply(optimizer$param_groups, function(pg) pg$lr, numeric(1))
+
+# ---- Loss / AMP / 日志 ----
+criterion <- distill_loss_fn(temperature = TEMPERATURE, alpha = ALPHA)
+scaler    <- if (use_amp) cuda_amp_grad_scaler() else NULL
+
+log_file <- sprintf("checkpoints/distill_loss_%s.csv", format(Sys.time(), "%H%M"))
+cat("epoch,iter,kl,ce,total,lr,global_step\n", file = log_file)
+
+optimizer$zero_grad()
+global_step <- 0
+init_mult   <- wsd_multiplier(1, total_steps = total_optim_steps)
+for (g in seq_along(optimizer$param_groups)) {
+  optimizer$param_groups[[g]]$lr <- group_base_lrs[[g]] * init_mult
+}
+current_lr <- group_base_lrs[2] * init_mult   # 日志用主组（全 LR）
+
+cat(sprintf("\n[%s] 15M 学生模型蒸馏 (device=%s AMP=%s accum=%d | total_optim_steps=%d)...\n",
+            format(Sys.time(), "%H:%M:%S"), device$type, use_amp, accum_steps, total_optim_steps))
+
+for (epoch in 1:DISTILL_EPOCHS) {
+  curtime    <- Sys.time()
+  model$train()
+  batch_idx   <- 0
+  epoch_kl    <- 0; epoch_ce <- 0; epoch_total <- 0
+  remainder   <- n_batches %% accum_steps
+
+  coro::loop(for (batch in train_dl) {
+    batch_idx <- batch_idx + 1
+
+    # 梯度累加：epoch 尾部余数 batch 用部分累加，末尾强制 step
+    current_accum_steps <- if (remainder != 0 && batch_idx > n_batches - remainder) {
+      remainder
+    } else {
+      accum_steps
+    }
+
+    input_data <- list(x = batch$x$x$to(device = device, non_blocking = nb))
+    target <- list(
+      y_hard     = batch$y$y_hard$to(device = device, non_blocking = nb),
+      topk_ids   = batch$y$topk_ids$to(device = device, non_blocking = nb),
+      topk_probs = batch$y$topk_probs$to(device = device, non_blocking = nb),
+      loss_mask  = batch$y$loss_mask$to(device = device, non_blocking = nb)
+    )
+
+    if (use_amp) {
+      with_autocast(device_type = "cuda", {
+        output <- model(input_data)
+        losses <- criterion(output, target)
+        loss_to_backprop <- losses$total / current_accum_steps
+      })
+    } else {
+      output <- model(input_data)
+      losses <- criterion(output, target)
+      loss_to_backprop <- losses$total / current_accum_steps
+    }
+
+    # 日志用未除以累加步数的原始 batch 均值（KL/CE 分开记录）
+    kl_val    <- losses$kl$item()
+    ce_val    <- losses$ce$item()
+    total_val <- losses$total$item()
+
+    if (use_amp) scaler$scale(loss_to_backprop)$backward() else loss_to_backprop$backward()
+
+    should_step <- (batch_idx %% accum_steps == 0 || batch_idx == n_batches)
+    if (should_step) {
+      global_step <- global_step + 1
+
+      if (use_amp) {
+        scaler$unscale_(optimizer)
+        nn_utils_clip_grad_norm_(model$parameters, max_norm = GRAD_CLIP)
+        scaler$step(optimizer)
+        scaler$update()
+      } else {
+        nn_utils_clip_grad_norm_(model$parameters, max_norm = GRAD_CLIP)
+        optimizer$step()
+      }
+
+      # WSD 分组 LR 写回：R 的 `for (pg in param_groups) pg$lr <- x` 是复制后
+      # 修改（no-op），必须按下标写回 optimizer$param_groups[[g]]$lr。
+      mult <- wsd_multiplier(min(global_step + 1, total_optim_steps), total_steps = total_optim_steps)
+      for (g in seq_along(optimizer$param_groups)) {
+        optimizer$param_groups[[g]]$lr <- group_base_lrs[[g]] * mult
+      }
+      current_lr <- group_base_lrs[2] * mult
+
+      optimizer$zero_grad()
+    }
+
+    epoch_kl    <- epoch_kl + kl_val
+    epoch_ce    <- epoch_ce + ce_val
+    epoch_total <- epoch_total + total_val
+
+    if (batch_idx %% 50 == 0 || batch_idx == 1) {
+      w <- nchar(as.character(n_batches))
+      cat(sprintf(
+        "Epoch [%d/%d] Batch [%*d/%d] step=%*d | kl=%.4f ce=%.4f total=%.4f | lr=%.2e\n",
+        epoch, DISTILL_EPOCHS, w, batch_idx, n_batches, w, global_step,
+        kl_val, ce_val, total_val, current_lr
+      ))
+    }
+    cat(sprintf("%d,%d,%.6f,%.6f,%.6f,%.6e,%d\n",
+                epoch, batch_idx, kl_val, ce_val, total_val, current_lr, global_step),
+        file = log_file, append = TRUE)
+  })
+
+  avg_kl    <- epoch_kl / batch_idx
+  avg_ce    <- epoch_ce / batch_idx
+  avg_total <- epoch_total / batch_idx
+  cat(sprintf("=== Epoch %d 结束，平均 kl=%.6f ce=%.6f total=%.6f ===\n",
+              epoch, avg_kl, avg_ce, avg_total))
+
+  ckpt_path <- sprintf("checkpoints/distill_model_%02d.pt", epoch)
+  torch_save(
+    list(
+      model       = model$state_dict(),
+      optimizer   = optimizer$state_dict(),
+      epoch       = epoch,
+      global_step = global_step,
+      kl          = avg_kl,
+      ce          = avg_ce,
+      total       = avg_total,
+      current_lr  = current_lr,
+      config = list(
+        vocab_size   = VOCAB_SIZE,
+        dim          = DIM,
+        n_layers     = N_LAYERS,
+        n_heads      = N_HEADS,
+        max_seq_len  = SEQ_LEN,
+        batch_size   = ENV_BATCH_SIZE,
+        accum_steps  = accum_steps,
+        base_lr      = BASE_LR,
+        weight_decay = WEIGHT_DECAY,
+        temperature  = TEMPERATURE,
+        alpha        = ALPHA,
+        objective    = "distill_casual_lm_native"
+      )
+    ),
+    ckpt_path
   )
+  cat(sprintf("Checkpoint saved: %s\n", ckpt_path))
+  cat('耗时', round(as.numeric(difftime(Sys.time(), curtime, units = "mins")), 2), '分钟\n')
+}
+
+cat("\n蒸馏训练完成！\n")
