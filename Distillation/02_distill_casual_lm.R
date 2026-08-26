@@ -16,7 +16,7 @@ if (is_mac) {
   ENV_BATCH_SIZE  <- 2
   ENV_USE_AMP     <- FALSE
 } else {
-  ENV_BATCH_SIZE  <- 128  # 15M 小模型显存开销极小，RTX 3090 可轻松开启 32~64
+  ENV_BATCH_SIZE  <- 64  # 15M 小模型显存开销极小，RTX 3090 可轻松开启 32~64
   ENV_USE_AMP     <- TRUE
 }
 
@@ -187,29 +187,195 @@ RtomicLazyChunksDataset <- dataset(
   }
 )
 
-# 训练脚本中的 DataLoader 组装
-# 兼容两种落盘位置：data/processed/（当前） 或 data/processed/chunks/（服务器侧）
-chunk_dirs <- c("data/processed/chunks", "data/processed")
-has_chunks <- vapply(chunk_dirs, function(d) {
-  length(list.files(d, pattern = "^chunk_.*\\.arrow$")) > 0
-}, logical(1))
-chunk_dir <- chunk_dirs[which(has_chunks)][1]
-if (is.na(chunk_dir)) {
-  stop("未找到 .arrow chunk 数据文件（data/processed/chunks/ 或 data/processed/）。请先运行 ts_span_align.py 生成教师侧投影数据。")
+# =====================================================================
+# RtomicBinDataset —— 定长 .bin 蒸馏软标签数据集（双模式）
+#
+# 由 pack_bin.py 把 01_ts_span_align.py 的 .arrow chunk 打包成单文件定长记录：
+#   每样本一条定长记录（little-endian，字段按序紧排、无对齐填充）：
+#     x          [T]   int16
+#     y_hard     [T]   int16
+#     topk_ids   [T,K] int16
+#     topk_probs [T,K] float32
+#     loss_mask  [T]   uint8
+#   配套 .meta（key=value）：top_k / target_len / stride / n_samples / endian。
+#
+# 双模式（借鉴 pure_infonce/01_pretrain.R 的全量载入模式，加内存护栏）：
+#   * RAM 模式（默认）：数据总字节 ≤ 内存上限（系统 RAM × ram_frac）时，启动时把整个
+#     .bin 读进一个普通 R raw 向量，.getitem 只做内存切片 + rawConnection 解码。
+#     无磁盘 I/O、O(1) 随机访问，且可开 num_workers>0（持有普通向量可被 worker 共享）。
+#   * STREAM 模式（兜底）：数据超出内存上限时，退回 seek + readBin 逐样本读取，
+#     内存 O(batch)，任意规模都能跑；此时 num_workers 必须为 0（持有连接无法共享）。
+#
+# 返回结构与 RtomicLazyChunksDataset 完全一致（供 distill_loss_fn 使用）：
+#   list(x = list(x = [T] long),
+#        y = list(y_hard = [T] long, topk_ids = [T,K] int32,
+#                 topk_probs = [T,K] float32, loss_mask = [T] bool))
+# =====================================================================
+
+# 跨平台探测物理内存（字节）。失败返回 NA → 用保守默认上限。
+detect_ram_bytes <- function() {
+  if (.Platform$OS.type != "unix") return(NA_real_)
+  if (Sys.info()["sysname"] == "Darwin") {
+    out <- suppressWarnings(system("sysctl -n hw.memsize", intern = TRUE))
+    if (length(out) == 1L) as.numeric(out) else NA_real_
+  } else {
+    mem <- tryCatch(readLines("/proc/meminfo"), error = function(e) character(0))
+    line <- grep("^MemTotal:", mem, value = TRUE)
+    if (length(line) == 1L) {
+      kb <- as.numeric(sub(".*:\\s*([0-9]+).*", "\\1", line))
+      if (!is.na(kb)) kb * 1024 else NA_real_
+    } else NA_real_
+  }
 }
 
-train_dataset <- RtomicLazyChunksDataset(chunk_dir = chunk_dir)
 
-train_dl <- dataloader(
-  train_dataset,
-  batch_size  = ENV_BATCH_SIZE,
-  # 数据集内部已做块级洗牌（每个 epoch 重建 perm），此处顺序迭代即可；
-  # 若 shuffle=TRUE 会产生全局随机索引，破坏块级局部性 → 逐 batch 跨 chunk 重读盘。
-  shuffle     = FALSE,
-  drop_last   = TRUE,
-  num_workers = 0,
-  pin_memory  = !is_mac
+RtomicBinDataset <- dataset(
+  name = "RtomicBinDataset",
+
+  initialize = function(bin_file, meta_file, target_len, ram_frac = 0.6) {
+    if (!file.exists(bin_file) || !file.exists(meta_file)) {
+      stop(sprintf(
+        "缺少定长 .bin 数据（%s / %s）。\n请先运行：python pack_bin.py --chunk-dir <chunk目录> --out %s",
+        bin_file, meta_file, bin_file
+      ))
+    }
+
+    # ---- 解析 .meta（key=value 文本，零依赖）----
+    meta <- readLines(meta_file, warn = FALSE)
+    kv <- strsplit(meta, "=", fixed = TRUE)
+    kv <- kv[lengths(kv) == 2L]
+    m <- setNames(
+      trimws(vapply(kv, function(p) p[[2]], character(1))),
+      trimws(vapply(kv, function(p) p[[1]], character(1)))
+    )
+
+    self$target_len <- as.integer(target_len)
+    self$K          <- as.integer(m[["top_k"]])
+    self$stride     <- as.numeric(m[["stride"]])
+    self$n_samples  <- as.integer(m[["n_samples"]])
+
+    # 防御：stride 必须与 (target_len, K) 自洽，防止 --top-k 变动后旧 bin 被误用
+    expect <- self$target_len * (2L + 2L + 2L * self$K + 4L * self$K + 1L)
+    if (self$stride != expect) {
+      stop(sprintf(
+        "meta 中 stride=%d 与 target_len=%d、K=%d 推算值 %d 不一致。\n请用 pack_bin.py 重新打包。",
+        self$stride, self$target_len, self$K, expect
+      ))
+    }
+
+    self$raw  <- NULL   # RAM 模式：整文件 raw 向量
+    self$con  <- NULL   # STREAM 模式：文件连接
+    self$mode <- "ram"
+
+    total_bytes <- self$stride * self$n_samples
+    ram <- detect_ram_bytes()
+    cap <- if (is.na(ram)) 8e9 else ram * ram_frac
+    gb  <- function(b) sprintf("%.1f GB", b / 1e9)
+
+    if (total_bytes <= cap) {
+      con <- file(bin_file, "rb")
+      self$raw <- readBin(con, what = "raw", n = total_bytes)
+      close(con)
+      message(sprintf(
+        "【RAM 模式】%d 条 × %d 字节/条 = %s ≤ 内存上限 %s：全量载入内存，切片随机访问、可开多 worker（num_workers>0）。",
+        self$n_samples, self$stride, gb(total_bytes), gb(cap)
+      ))
+    } else {
+      self$mode <- "stream"
+      self$con <- file(bin_file, "rb")
+      message(sprintf(
+        "【STREAM 模式】数据 %s 超过内存上限 %s：退回 seek+readBin 逐样本读取（内存 O(batch)），num_workers 必须保持 0。",
+        gb(total_bytes), gb(cap)
+      ))
+    }
+  },
+
+  .getitem = function(i) {
+    T <- self$target_len
+    K <- self$K
+
+    if (self$mode == "ram") {
+      # O(1) 内存切片：整条记录 raw 切片 → rawConnection 解码 5 个字段
+      start <- (i - 1L) * self$stride + 1L
+      rec <- self$raw[start:(start + self$stride - 1L)]
+      rc <- rawConnection(rec, "rb")
+      on.exit(close(rc), add = TRUE)
+      x   <- readBin(rc, "integer", n = T,     size = 2L, signed = TRUE,  endian = "little")
+      y   <- readBin(rc, "integer", n = T,     size = 2L, signed = TRUE,  endian = "little")
+      ids <- readBin(rc, "integer", n = T * K, size = 2L, signed = TRUE,  endian = "little")
+      pr  <- readBin(rc, "numeric", n = T * K, size = 4L, endian = "little")
+      m   <- readBin(rc, "integer", n = T,     size = 1L, signed = FALSE, endian = "little")
+    } else {
+      con <- self$con
+      seek(con, where = (i - 1L) * self$stride, origin = "start")
+      x   <- readBin(con, "integer", n = T,     size = 2L, signed = TRUE,  endian = "little")
+      y   <- readBin(con, "integer", n = T,     size = 2L, signed = TRUE,  endian = "little")
+      ids <- readBin(con, "integer", n = T * K, size = 2L, signed = TRUE,  endian = "little")
+      pr  <- readBin(con, "numeric", n = T * K, size = 4L, endian = "little")
+      m   <- readBin(con, "integer", n = T,     size = 1L, signed = FALSE, endian = "little")
+    }
+
+    list(
+      x = list(x = torch_tensor(x, dtype = torch_long())),
+      y = list(
+        y_hard     = torch_tensor(y, dtype = torch_long()),
+        topk_ids   = torch_tensor(ids, dtype = torch_int())$view(c(T, K)),
+        topk_probs = torch_tensor(pr, dtype = torch_float32())$view(c(T, K)),
+        loss_mask  = torch_tensor(m > 0, dtype = torch_bool())
+      )
+    )
+  },
+
+  .length = function() {
+    self$n_samples
+  }
 )
+
+# 训练脚本中的 DataLoader 组装
+# ---------------------------------------------------------------------------
+# 首选【定长 .bin + seek】路径（pack_bin.py 打包）：训练期 O(1) 定位、逐样本小读，
+# 无整块读盘卡顿、内存 O(batch)。.bin 缺失时回退惰性 arrow chunk 路径。
+# ---------------------------------------------------------------------------
+BIN_FILE <- "data/processed/distill_labels.bin"
+BIN_META <- "data/processed/distill_labels.meta"
+
+if (file.exists(BIN_FILE) && file.exists(BIN_META)) {
+  train_dataset <- RtomicBinDataset(
+    bin_file   = BIN_FILE,
+    meta_file  = BIN_META,
+    target_len = TARGET_LEN
+  )
+  train_dl <- dataloader(
+    train_dataset,
+    batch_size  = ENV_BATCH_SIZE,
+    shuffle     = TRUE,    # bin 为 O(1) 随机访问，可全局洗牌
+    drop_last   = TRUE,
+    num_workers = if (identical(train_dataset$mode, "ram")) 4L else 0L,
+    pin_memory  = !is_mac
+  )
+} else {
+  # 兜底：惰性 arrow chunk（建议先跑 pack_bin.py 消除训练期读盘卡顿）
+  chunk_dirs <- c("data/processed/chunks", "data/processed")
+  has_chunks <- vapply(chunk_dirs, function(d) {
+    length(list.files(d, pattern = "^chunk_.*\\.arrow$")) > 0
+  }, logical(1))
+  chunk_dir <- chunk_dirs[which(has_chunks)][1]
+  if (is.na(chunk_dir)) {
+    stop("未找到 .bin 或 .arrow chunk 数据。请先运行 01_ts_span_align.py 生成投影数据，再 pack_bin.py 打包。")
+  }
+  train_dataset <- RtomicLazyChunksDataset(chunk_dir = chunk_dir)
+  message("未找到 distill_labels.bin，回退到惰性 chunk 路径（训练期会周期性读盘卡顿）。建议先运行 pack_bin.py。")
+  train_dl <- dataloader(
+    train_dataset,
+    batch_size  = ENV_BATCH_SIZE,
+    # 数据集内部已做块级洗牌（每个 epoch 重建 perm），此处顺序迭代即可；
+    # 若 shuffle=TRUE 会产生全局随机索引，破坏块级局部性 → 逐 batch 跨 chunk 重读盘。
+    shuffle     = FALSE,
+    drop_last   = TRUE,
+    num_workers = 0,
+    pin_memory  = !is_mac
+  )
+}
 
 # =====================================================================
 # 3. 带 Loss Mask 的 Top-K 蒸馏混合 Loss 函数 (原生 R torch 兼容版)
