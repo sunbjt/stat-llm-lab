@@ -1,53 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ts_span_align.py —— 异构 Tokenizer 离线蒸馏数据生成（含学生词表投影）
-
-教师: Qwen2.5-3B-Instruct (Python / GPU 服务器)
-学生: 15M RtomicCausalLM (R torch, 16384 字符级 BPE)
-产出: 已投影到【学生词表】的 .arrow chunk，可直接被 02_distill_casual_lm.R 训练
-      （schema: x/y_hard int32 flat、topk_ids fixed_size_list[K] int32、topk_probs fixed_size_list[K]
-       float32、loss_mask bool；zstd 压缩，R 的 arrow 可读）。K 默认 16，可用 --top-k 覆盖。
-       【v2 格式】probs 由 float16 升为 float32（仍 fixed_size_list）：R arrow 会把 halffloat 位模式
-       按 int16 解读（1.0 → 15360，曾导致 loss~767027），float32 无此问题、读入零 cast。
-
 ========================================================================
-一、投影算法（与用户确认：取学生子词 + 概率加和 + 归一化）
-========================================================================
-教师词表(~15.2万字节级 BPE)与学生词表(16384 字符级 BPE)无任何 ID 对应关系，
-因此投影必须经过文本桥：
-    教师 token id --解码(Qwen)--> 文本 --编码(学生 YTTM BPE)--> 学生子词 id
-
-每学生位置 i 的边界 b = 学生 token i+1 的起始字符。取【包含 b 的教师 token k】：
-  * 教师预测 token k 的分布 = logits[k-1]（即上一教师边界处的 logits）
-  * 目标字符偏移 off = b - start(k)   （b 恰为 token 起点时 off=0，等价"取第一个子词"）
-对 logits[k-1] 的 top-K 每个候选教师 token：
-  * 解码 → 文本 → 学生 BPE 编码 → 取【覆盖字符 off 的那个学生子词】id
-  * 多个候选投到同一学生 id → 概率【加和】
-取 top-K（默认 16，--top-k 可调）并【归一化】，存为该位置的软标签。
-
-注意：b 在第一个教师 token 内部时（k=0，无 logits[-1]）该位置无教师信号 → loss_mask=False。
-
-========================================================================
-二、服务器安装与运行
+服务器安装与运行
 ========================================================================
     pip install Cython
     pip install youtokentome           # 与 R 包 tokenizers.bpe 同一 C++ 库
-    python ts_span_align.py --self-test   # 先自检学生 BPE 加载/偏移重建
-    python ts_span_align.py --limit 50    # 小样本试跑
-    python ts_span_align.py               # 全量
+    pip install git+https://github.com/LahiLuk/YouTokenToMe # 装不上用这个
+    python3  Distillation/01_ts_span_align.py --self-test   # 先自检学生 BPE 加载/偏移重建
+    python3 Distillation/01_ts_span_align.py --limit 50    # 小样本试跑
+    python3 Distillation/01_ts_span_align.py               # 全量
 
 若 youtokentome 源码编译失败（备选路线，未实现）：
   本脚本只出教师 top-k ids + 字符偏移 + id→text 词典；
   R 侧用 tokenizers.bpe（同一 C++ 库，已本地验证）完成对齐与投影。
 ========================================================================
 """
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import argparse
 import bisect
 import gc
 import json
 import os
+import platform
 import re
 import sys
 
@@ -60,35 +37,61 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     import youtokentome as yttm
-except ImportError:  # 延迟到 main() 再报错，保证 --help 可用
+except ImportError:
     yttm = None
 
-# ==================== 配置项 ====================
-INPUT_JSONL = "/root/autodl-tmp/stat-llm-lab/data/raw/pretrain_clean.jsonl"
-OUTPUT_CHUNK_DIR = "/root/autodl-tmp/stat-llm-lab/data/processed/chunks/"
-MODEL_NAME_OR_PATH = "Qwen/Qwen2.5-3B-Instruct"
-CACHE_DIR = "/root/autodl-tmp/cache"
-# 学生 BPE 模型（YTTM 格式，与 R 侧 models/rtomic_bpe.model 相同）
-STUDENT_MODEL_PATH = "/root/autodl-tmp/stat-llm-lab/models/rtomic_bpe.model"
+# ==================== 1. 环境与路径自动检测（复刻 config.R 逻辑） ====================
+system_name = platform.system()
+is_mac = (system_name == "Darwin")
+is_linux = (system_name == "Linux")
+cuda_available = torch.cuda.is_available()
 
-MAX_LENGTH = 512
-TARGET_LEN = MAX_LENGTH - 1  # Causal LM 输入输出偏移长度 (511)
+if is_mac:
+    print("--- 检测到 Mac 环境：切换至【本地测试模式】---")
+    WORK_DIR = os.path.expanduser("~/github/stat-llm-lab/")
+    CACHE_DIR = os.path.expanduser("~/cache/huggingface")
+    os.environ["OMP_NUM_THREADS"] = "4"
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+elif is_linux and cuda_available:
+    print("--- 检测到 Linux + GPU 环境：切换至【服务器 GPU 训练模式】---")
+    WORK_DIR = "/root/autodl-tmp/stat-llm-lab/"
+    CACHE_DIR = "/root/autodl-tmp/cache"
+    os.environ["OMP_NUM_THREADS"] = "4"
+    device = "cuda"
+else:
+    WORK_DIR = os.path.abspath(".")
+    CACHE_DIR = os.path.expanduser("~/cache/huggingface")
+    device = "cpu"
+
+# 切换工作目录
+os.chdir(WORK_DIR)
+
+# 基于 WORK_DIR 动态构建相对路径
+INPUT_JSONL = os.path.join(WORK_DIR, "data/raw/pretrain_clean.jsonl")
+OUTPUT_CHUNK_DIR = os.path.join(WORK_DIR, "data/processed/chunks/")
+STUDENT_MODEL_PATH = os.path.join(WORK_DIR, "models/rtomic_bpe.model")
+
+MODEL_NAME_OR_PATH = "Qwen/Qwen2.5-3B-Instruct"
+
+# ==================== 2. 模型超参数（与 R 侧 config.R 对应） ====================
+VOCAB_SIZE = 151936               # 教师词表
+STUDENT_VOCAB_SIZE = 2**14        # 16384 (2^14)，对应 config.R 中的 VOCAB_SIZE
+MAX_LENGTH = 512                  # 对应 config.R 中的 SEQ_LEN
+TARGET_LEN = MAX_LENGTH           # Causal LM 输入输出偏移长度 (511)
+
 TOP_K = 16
 TEMPERATURE = 1.0
 BATCH_SIZE = 16
-CHUNK_SIZE = 4096
+CHUNK_SIZE = 4096*8
 LIMIT_NUM = 100000
-VOCAB_SIZE = 151936  # 教师词表（仅用于日志）
 
-# ---- 学生词表约定（与 R 侧一致）----
-STUDENT_VOCAB_SIZE = 16384          # 2^14
-PAD_SURFACE = 1                     # R 表层 PAD（YTTM id 0 + 1）
-UNK_SURFACE = 2                     # R 表层 UNK（YTTM id 1 + 1）
-MAX_STUDENT_LEN = MAX_LENGTH        # 512：学生 token 序列上限（x/y 各 511）
-MAX_TEACHER_TOKENS = 1024           # 教师侧序列安全上限（学生 ≤512 时通常用不到）
+# ---- 学生词表约定 ----
+PAD_SURFACE = 1                     # R 表层 PAD
+UNK_SURFACE = 2                     # R 表层 UNK
+MAX_STUDENT_LEN = MAX_LENGTH + 1    # 512：学生 token 序列上限
+MAX_TEACHER_TOKENS = 1024           # 教师侧序列安全上限
 # ===============================================
 
-# R 侧 clean_text_internal 的标点隔离模式（perl=TRUE 语义一致）
 _PUNCT_RE = re.compile(r"([,.:;!?\"'(){}[\]，。！？；：—（）《》“”‘’、])")
 
 
@@ -99,11 +102,7 @@ def clean_text(text: str) -> str:
     return out.strip()
 
 
-# ---------------------------------------------------------------------------
-# 学生侧：YTTM 编码 + 字符偏移（偏移规则已用 R 侧同一 C++ 库验证）
-# ---------------------------------------------------------------------------
 def student_encode(student_model, ct: str):
-    """返回 (subs, surface_ids)。surface = min(yttm_id + 1, 16383)。"""
     subs = student_model.encode(ct, output_type=yttm.OutputType.SUBWORD)
     ids0 = student_model.encode(ct, output_type=yttm.OutputType.ID)
     assert len(subs) == len(ids0), (len(subs), len(ids0))
@@ -112,11 +111,6 @@ def student_encode(student_model, ct: str):
 
 
 def student_offsets(subs, ct: str):
-    """
-    子词 → 0-based 字符偏移。
-    规则（已 R 验证）：▁→空格；首子词若以空格开头而 ct 不以空格开头，
-    去掉该前导空格（YTTM 在文本开头发的是边界标记而非真实空格）。ct 已 strip。
-    """
     parts = [s.replace("▁", " ") for s in subs]
     if parts and parts[0].startswith(" ") and not ct.startswith(" "):
         parts[0] = parts[0][1:]
@@ -132,7 +126,6 @@ def student_offsets(subs, ct: str):
 
 
 def process_text_student(text: str, student_model):
-    """清洗 + 学生编码；若 > 512 个学生 token，在边界处截断文本后重编。"""
     ct = clean_text(text)
     if not ct:
         return None
@@ -140,22 +133,18 @@ def process_text_student(text: str, student_model):
     starts, ends = student_offsets(subs, ct)
     L = len(surface)
     if L > MAX_STUDENT_LEN:
-        cut = starts[MAX_STUDENT_LEN]  # 第 513 个子词的起始字符
+        cut = starts[MAX_STUDENT_LEN]
         ct = ct[:cut]
         subs, surface = student_encode(student_model, ct)
         starts, ends = student_offsets(subs, ct)
         L = len(surface)
         assert L <= MAX_STUDENT_LEN
     if L < 2:
-        return None  # 无法形成 x/y 对
+        return None
     return ct, subs, surface, starts, ends
 
 
-# ---------------------------------------------------------------------------
-# 教师侧：offset 单位检测（byte-level BPE 的 offset_mapping 可能是字节偏移）
-# ---------------------------------------------------------------------------
 def resolve_offset_unit(teacher_tok, text: str):
-    """检测教师 offset_mapping 是字符偏移还是字节偏移（对多字节文本才关键）。"""
     enc = teacher_tok(text, return_offsets_mapping=True, add_special_tokens=False)
     ids, offs = enc["input_ids"], enc["offset_mapping"]
     if not ids:
@@ -188,7 +177,6 @@ def resolve_offset_unit(teacher_tok, text: str):
 
 
 def offsets_to_char(offs, unit, text):
-    """把教师 offset_mapping 统一成字符偏移（0-based, 闭开区间）。"""
     if unit == "char":
         return [(s, e) for s, e in offs]
     b2c = []
@@ -202,14 +190,10 @@ def offsets_to_char(offs, unit, text):
     return out
 
 
-# ---------------------------------------------------------------------------
-# 投影：教师 token → 学生子词序列（按 teacher_id 缓存，一次编码处处复用）
-# ---------------------------------------------------------------------------
 _TEACHER_STUDENT_CACHE = {}
 
 
 def teacher_token_student_encoding(tid, teacher_tok, student_model):
-    """教师 token id → (学生表层 id 序列, 子词 starts, 子词 ends)。"""
     if tid in _TEACHER_STUDENT_CACHE:
         return _TEACHER_STUDENT_CACHE[tid]
 
@@ -223,7 +207,7 @@ def teacher_token_student_encoding(tid, teacher_tok, student_model):
     ids0 = student_model.encode(ctxt, output_type=yttm.OutputType.ID)
     parts = [s.replace("▁", " ") for s in subs]
     if parts and parts[0].startswith(" "):
-        parts[0] = parts[0][1:]  # 候选文本已 clean → 无前导空格
+        parts[0] = parts[0][1:]
     starts, ends = [], []
     pos = 0
     for p in parts:
@@ -231,7 +215,6 @@ def teacher_token_student_encoding(tid, teacher_tok, student_model):
         pos += len(p)
         ends.append(pos)
     if pos != len(ctxt) or len(ids0) != len(parts):
-        # 防御：重建失败（如含 UNK 子词）→ 退化为首个子词
         if not ids0:
             _TEACHER_STUDENT_CACHE[tid] = ([UNK_SURFACE], [0], [1])
         else:
@@ -243,7 +226,6 @@ def teacher_token_student_encoding(tid, teacher_tok, student_model):
 
 
 def subword_at(surface, starts, ends, off):
-    """返回覆盖字符 off 的学生子词 id；off 越界时钳到最后子词。"""
     if not surface:
         return UNK_SURFACE
     idx = bisect.bisect_right(starts, off) - 1
@@ -252,24 +234,22 @@ def subword_at(surface, starts, ends, off):
 
 
 def find_teacher_signal(b, t_starts, t_ends):
-    """学生边界 b → (教师 logits 位置 j, 候选 token 内偏移 off) 或 None。"""
     k = bisect.bisect_right(t_starts, b) - 1
     if k < 0 or k >= len(t_ends) or b >= t_ends[k]:
         return None
     j = k - 1
-    if j < 0:  # b 在第一个教师 token 内部，无 logits[-1] 可用
+    if j < 0:
         return None
     return j, b - t_starts[k]
 
 
 def project_topk(tids, tprobs, off, teacher_tok, student_model):
-    """教师 top-K (id, prob) → 学生 top-K (表层 id, 归一化 prob)。"""
     agg = {}
     for tid, p in zip(tids, tprobs):
         tid, p = int(tid), float(p)
         surface, starts, ends = teacher_token_student_encoding(tid, teacher_tok, student_model)
         sid = subword_at(surface, starts, ends, off)
-        agg[sid] = agg.get(sid, 0.0) + p  # 概率加和
+        agg[sid] = agg.get(sid, 0.0) + p
 
     items = sorted(agg.items(), key=lambda kv: -kv[1])
     if not items:
@@ -278,7 +258,7 @@ def project_topk(tids, tprobs, off, teacher_tok, student_model):
     out_ps = [p for _, p in items[:TOP_K]]
     tot = sum(out_ps)
     if tot > 0:
-        out_ps = [p / tot for p in out_ps]  # 归一化
+        out_ps = [p / tot for p in out_ps]
     pad = TOP_K - len(out_ids)
     if pad > 0:
         out_ids += [PAD_SURFACE] * pad
@@ -288,7 +268,6 @@ def project_topk(tids, tprobs, off, teacher_tok, student_model):
 
 def build_sample(surface, starts, ends, t_ids, t_starts, t_ends,
                  batch_topk_ids, batch_topk_probs, teacher_tok, student_model):
-    """组装一条已对齐、已投影的样本（长度 TARGET_LEN，不足补 PAD）。"""
     L = len(surface)
     n_real = L - 1
     xa = np.full(TARGET_LEN, PAD_SURFACE, dtype=np.int32)
@@ -297,16 +276,16 @@ def build_sample(surface, starts, ends, t_ids, t_starts, t_ends,
     ya[:n_real] = surface[1:]
 
     tids_a = np.full((TARGET_LEN, TOP_K), PAD_SURFACE, dtype=np.int32)
-    tprobs_a = np.zeros((TARGET_LEN, TOP_K), dtype=np.float16)  # float16 存盘，体积减半
+    tprobs_a = np.zeros((TARGET_LEN, TOP_K), dtype=np.float16)
     mask_a = np.zeros(TARGET_LEN, dtype=bool)
 
     for i in range(n_real):
-        b = starts[i + 1]  # 边界 = 学生 token i+1 的起始字符
+        b = starts[i + 1]
         sig = find_teacher_signal(b, t_starts, t_ends)
         if sig is None:
-            continue  # 无教师信号 → mask=False
+            continue
         j, off = sig
-        if j >= len(t_ids) - 1:  # j 超出教师 logits 范围（预测最后一个 token 之后）
+        if j >= len(t_ids) - 1:
             continue
         tids, tprobs = project_topk(
             batch_topk_ids[j], batch_topk_probs[j], off, teacher_tok, student_model
@@ -323,9 +302,6 @@ def to_fixed_array(np_arr, inner_size):
     return pa.FixedSizeListArray.from_arrays(pa.array(flat), inner_size)
 
 
-# ---------------------------------------------------------------------------
-# 自检模式：验证学生 BPE 加载 + 偏移重建（服务器上先跑一次）
-# ---------------------------------------------------------------------------
 def self_test(student_model):
     print("youtokentome 版本:", getattr(yttm, "__version__", "?"))
     print("学生词表大小:", len(student_model.vocab()))
@@ -347,11 +323,8 @@ def self_test(student_model):
     print("\n✅ 自检通过：学生 BPE 加载正常、字符偏移重建一致。可进入正式生成。")
 
 
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
 def main():
-    global TOP_K  # 允许命令行覆盖（build_sample / project_topk 读取模块全局）
+    global TOP_K
     ap = argparse.ArgumentParser(description="Qwen→Rtomic 学生词表投影蒸馏数据生成")
     ap.add_argument("--student-model", default=STUDENT_MODEL_PATH)
     ap.add_argument("--input-jsonl", default=INPUT_JSONL)
@@ -363,10 +336,10 @@ def main():
     ap.add_argument("--top-k", type=int, default=TOP_K, help="教师 Top-K 投影数（默认 16；越小文件越小）")
     args = ap.parse_args()
 
-    # 【版本标记】每次运行必须打印自己的绝对路径与关键参数，杜绝"跑错文件/跑旧拷贝"。
-    # 若输出路径与预期不符，说明运行的不是这份脚本。
     print("=" * 70)
     print(f"[运行脚本] {os.path.abspath(__file__)}")
+    print(f"[工作路径] {WORK_DIR}")
+    print(f"[运行设备] {device}")
     print(f"[参数] top_k={args.top_k} chunk_size={args.chunk_size} batch_size={args.batch_size} "
           f"limit={args.limit} output_dir={args.output_dir}")
     print("[归一化检查] tk_probs = exp(tk_logits - lse)（必须存在，否则是旧脚本）")
@@ -392,9 +365,6 @@ def main():
         self_test(student_model)
         return
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"正在使用设备: {device}")
-
     teacher_tok = AutoTokenizer.from_pretrained(
         MODEL_NAME_OR_PATH, cache_dir=CACHE_DIR, trust_remote_code=True
     )
@@ -402,12 +372,15 @@ def main():
     if teacher_tok.pad_token is None:
         teacher_tok.pad_token = teacher_tok.eos_token
 
+    model_device_map = "cuda" if device == "cuda" else ("mps" if device == "mps" else "cpu")
+    model_dtype = torch.bfloat16 if device in ["cuda", "mps"] else torch.float32
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME_OR_PATH,
         cache_dir=CACHE_DIR,
-        dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-        device_map="cuda" if device == "cuda" else "cpu",
+        dtype=model_dtype,
+        attn_implementation="sdpa" if device == "cuda" else "eager",
+        device_map=model_device_map,
         trust_remote_code=True,
     )
     model.eval()
@@ -425,7 +398,6 @@ def main():
         indexed_texts = indexed_texts[:args.limit]
         print(f"【测试模式】仅处理前 {len(indexed_texts)} 条。")
 
-    # 教师 offset 单位（首条文本检测一次，全局固定）
     offset_unit = None
 
     chunk_x, chunk_y = [], []
@@ -443,7 +415,6 @@ def main():
         mask_b = np.stack(chunk_mask)
         N = xb.shape[0]
 
-        # ---- 存盘前自检：软标签必须已归一化（防止旧版/错误脚本把未归一化 exp(logits) 写盘）----
         p_max = tprobs_b.max()
         if p_max > 1.0 + 1e-3:
             raise ValueError(
@@ -456,9 +427,6 @@ def main():
                 f"topk_probs 行和最大值 {row_sums.max()} 超出 1.0（未归一化）。"
             )
 
-        # v2 格式：仍用 fixed_size_list[K]（Arrow 表要求各列等长），仅把 probs 由 float16 升为
-        # float32。halffloat 的位模式会被 R arrow 按 int16 解读（1.0→15360，曾致 loss~767027）；
-        # float32 无此问题，R 端 as.vector 直接得到正确数值、免去 cast。
         table = pa.Table.from_arrays(
             [
                 pa.array(xb.reshape(-1), type=pa.int32()),
@@ -470,20 +438,20 @@ def main():
             names=["x", "y_hard", "topk_ids", "topk_probs", "loss_mask"],
         )
         out_file = os.path.join(args.output_dir, f"chunk_{chunk_idx:03d}.arrow")
-        feather.write_feather(table, out_file, compression="zstd")  # zstd 压缩，R 的 arrow 可解压
+        feather.write_feather(table, out_file, compression="zstd")
         print(f"\n已存盘 Chunk {chunk_idx}: {out_file}（{cur_size} 条）")
         chunk_x.clear(); chunk_y.clear()
         chunk_tids.clear(); chunk_tprobs.clear(); chunk_mask.clear()
         cur_size = 0
         chunk_idx += 1
         gc.collect()
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     total = len(indexed_texts)
     for bi in tqdm(range(0, total, args.batch_size), desc="Projecting soft labels"):
         batch = indexed_texts[bi: bi + args.batch_size]
 
-        # 1) 学生侧：清洗 + 编码 + 偏移
         stud = []
         for _, txt in batch:
             r = process_text_student(txt, student_model)
@@ -492,7 +460,6 @@ def main():
         if not stud:
             continue
 
-        # 2) 教师侧：逐条 tokenize 取 offsets（不 padding）
         t_ids_list, t_offs_list = [], []
         for ct, _subs, _surface, _starts, _ends in stud:
             enc = teacher_tok(
@@ -505,14 +472,12 @@ def main():
             t_ids_list.append(enc["input_ids"])
             t_offs_list.append(enc["offset_mapping"])
         if offset_unit is None:
-            # 只在含非 ASCII 字符的文本上检测（全 ASCII 时字节偏移 == 字符偏移，无法区分）
             probe = next((s[0] for s in stud if any(ord(c) > 127 for c in s[0])), None)
             if probe is not None:
                 offset_unit = resolve_offset_unit(teacher_tok, probe)
             else:
                 offset_unit = "char"
 
-        # 3) 前向
         Tmax = max(len(t) for t in t_ids_list)
         Tmax = max(Tmax, 2)
         input_ids_t = torch.zeros(len(stud), Tmax, dtype=torch.long, device=device)
@@ -528,12 +493,11 @@ def main():
             logits_shifted = logits[:, :-1, :] / TEMPERATURE
             lse = torch.logsumexp(logits_shifted, dim=-1, keepdim=True)
             tk_logits, tk_ids = torch.topk(logits_shifted, k=TOP_K, dim=-1)
-            tk_probs = torch.exp(tk_logits - lse)  # [B, Tmax-1, K]
+            tk_probs = torch.exp(tk_logits - lse)
             tk_ids_np = tk_ids.cpu().numpy()
             tk_probs_np = tk_probs.float().cpu().numpy()
             del logits, logits_shifted, tk_logits
 
-        # 4) 对齐 + 投影 + 组装
         for b, (ct, subs, surface, starts, ends) in enumerate(stud):
             t_ids = t_ids_list[b]
             t_starts = [o[0] for o in offsets_to_char(t_offs_list[b], offset_unit, ct)]
@@ -549,7 +513,8 @@ def main():
             chunk_mask.append(mask_a)
             cur_size += 1
 
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            torch.cuda.empty_cache()
         if cur_size >= args.chunk_size:
             save_chunk()
 
