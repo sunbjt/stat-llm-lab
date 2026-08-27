@@ -27,6 +27,7 @@ import os
 import platform
 import re
 import sys
+import time
 
 import numpy as np
 import pyarrow as pa
@@ -82,13 +83,19 @@ TARGET_LEN = MAX_LENGTH           # Causal LM 输入输出偏移长度 (511)
 TOP_K = 16
 TEMPERATURE = 1.0
 BATCH_SIZE = 16
-CHUNK_SIZE = 4096*8
+CHUNK_SIZE = 4096
 LIMIT_NUM = 100000
 
 # ---- 学生词表约定 ----
 PAD_SURFACE = 1                     # R 表层 PAD
 UNK_SURFACE = 2                     # R 表层 UNK
 MAX_STUDENT_LEN = MAX_LENGTH + 1    # 512：学生 token 序列上限
+
+# 学生软目标中要剔除的"垃圾表面"：特殊 token (PAD/UNK/BOS/EOS) 与 U+FFFD (词表 id 4346)。
+# 教师稀有词在学生 16384 词表里没有对应表项 → yttm 投影成 UNK；含乱码字符的教师 token → 投影成 U+FFFD。
+# 若让这些垃圾进入软目标，学生会被训练成"不确定时就吐 UNK/�"——生成时直接塌缩成乱码死循环
+# (实测旧数据里 14.8% 的目标质量是垃圾，14.9% 的位置垃圾占比 > 50%)。
+JUNK_SURFACES = frozenset({PAD_SURFACE, UNK_SURFACE, 3, 4, 4346})
 MAX_TEACHER_TOKENS = 1024           # 教师侧序列安全上限
 # ===============================================
 
@@ -115,7 +122,20 @@ def student_offsets(subs, ct: str):
     if parts and parts[0].startswith(" ") and not ct.startswith(" "):
         parts[0] = parts[0][1:]
     rebuilt = "".join(parts)
-    assert rebuilt == ct, (rebuilt, ct)
+    if rebuilt != ct:
+        # 报错里带首个差异位置,便于定位(通常是截断点后的结尾空白,见 process_text_student)
+        for i, (a, b) in enumerate(zip(rebuilt, ct)):
+            if a != b:
+                diff = i
+                break
+        else:
+            diff = min(len(rebuilt), len(ct))
+        raise AssertionError(
+            f"student_offsets: 子词重建与文本不符 @{diff} "
+            f"(rebuilt len={len(rebuilt)}, ct len={len(ct)})\n"
+            f"  rebuilt: {rebuilt[max(0, diff-20):diff+40]!r}\n"
+            f"  ct     : {ct[max(0, diff-20):diff+40]!r}"
+        )
     starts, ends = [], []
     pos = 0
     for p in parts:
@@ -135,6 +155,10 @@ def process_text_student(text: str, student_model):
     if L > MAX_STUDENT_LEN:
         cut = starts[MAX_STUDENT_LEN]
         ct = ct[:cut]
+        # 截断点可能正好落在一个空格 token 之后（如 " , "），结尾空格在 BPE 里无法重建
+        # （yttm 重建会丢尾部空白 → student_offsets 断言失败）。去掉结尾空白即可，
+        # 不影响已包含 token 的边界偏移。
+        ct = ct.rstrip()
         subs, surface = student_encode(student_model, ct)
         starts, ends = student_offsets(subs, ct)
         L = len(surface)
@@ -249,6 +273,9 @@ def project_topk(tids, tprobs, off, teacher_tok, student_model):
         tid, p = int(tid), float(p)
         surface, starts, ends = teacher_token_student_encoding(tid, teacher_tok, student_model)
         sid = subword_at(surface, starts, ends, off)
+        if sid in JUNK_SURFACES:
+            # 该教师候选投影到 UNK/� 等垃圾表面：不计入学生软目标，不参与重归一化。
+            continue
         agg[sid] = agg.get(sid, 0.0) + p
 
     items = sorted(agg.items(), key=lambda kv: -kv[1])
@@ -333,6 +360,8 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
+    ap.add_argument("--slab-size", type=int, default=0,
+                    help="teacher 结果驻留内存的文本批（默认 = chunk_size；调大分桶更细但内存更高）")
     ap.add_argument("--top-k", type=int, default=TOP_K, help="教师 Top-K 投影数（默认 16；越小文件越小）")
     args = ap.parse_args()
 
@@ -340,8 +369,9 @@ def main():
     print(f"[运行脚本] {os.path.abspath(__file__)}")
     print(f"[工作路径] {WORK_DIR}")
     print(f"[运行设备] {device}")
-    print(f"[参数] top_k={args.top_k} chunk_size={args.chunk_size} batch_size={args.batch_size} "
-          f"limit={args.limit} output_dir={args.output_dir}")
+    slab_size = args.slab_size if args.slab_size > 0 else args.chunk_size
+    print(f"[参数] top_k={args.top_k} chunk_size={args.chunk_size} slab_size={slab_size} "
+          f"batch_size={args.batch_size} limit={args.limit} output_dir={args.output_dir}")
     print("[归一化检查] tk_probs = exp(tk_logits - lse)（必须存在，否则是旧脚本）")
     print("[自检检查] save_chunk 内置 probs>1 报错（必须存在，否则是旧脚本）")
     print("=" * 70)
@@ -392,8 +422,9 @@ def main():
             if line.strip():
                 item = json.loads(line)
                 indexed_texts.append((idx, item["text"]))
-    print(f"共读取 {len(indexed_texts)} 条，按长度排序...")
-    indexed_texts.sort(key=lambda x: len(x[1]))
+    # 原始 jsonl 已随机打乱，不做长度重排 —— 长度排序会让 chunk 内样本长度趋同，
+    # 导致 chunk_001 全是短文本、loss_mask 有效率骤降（如仅 12.63%）。
+    print(f"共读取 {len(indexed_texts)} 条（保持原始随机顺序）。")
     if args.limit and args.limit > 0:
         indexed_texts = indexed_texts[:args.limit]
         print(f"【测试模式】仅处理前 {len(indexed_texts)} 条。")
@@ -449,19 +480,31 @@ def main():
             torch.cuda.empty_cache()
 
     total = len(indexed_texts)
-    for bi in tqdm(range(0, total, args.batch_size), desc="Projecting soft labels"):
-        batch = indexed_texts[bi: bi + args.batch_size]
+    # offset_unit 对全语料只解析一次
+    if offset_unit is None:
+        probe = next((t for _, t in indexed_texts if any(ord(c) > 127 for c in t)), None)
+        if probe is not None:
+            offset_unit = resolve_offset_unit(teacher_tok, probe)
+        else:
+            offset_unit = "char"
 
-        stud = []
-        for _, txt in batch:
+    # chunk 组成保持原始随机顺序（每 chunk 长度混合、代表整体语料），
+    # 只在 slab 内对 teacher forward 按长度分桶，把每个 batch 的 padding 降到最低。
+    # slab 是 teacher 结果驻留内存的上界：越大分桶越细，但内存越高。
+    slab_size = args.slab_size if args.slab_size > 0 else args.chunk_size
+
+    n_slabs = (total + slab_size - 1) // slab_size
+    for s0 in tqdm(range(0, total, slab_size), desc="Projecting soft labels"):
+        slab = indexed_texts[s0: s0 + slab_size]
+        t0 = time.time()
+
+        # 1) 一次性 token 化（无模型计算）：学生编码 + 教师编码/字符偏移
+        prepped = []
+        for idx, txt in slab:
             r = process_text_student(txt, student_model)
-            if r is not None:
-                stud.append(r)
-        if not stud:
-            continue
-
-        t_ids_list, t_offs_list = [], []
-        for ct, _subs, _surface, _starts, _ends in stud:
+            if r is None:
+                continue
+            ct, _subs, surface, starts, ends = r
             enc = teacher_tok(
                 ct,
                 return_offsets_mapping=True,
@@ -469,54 +512,69 @@ def main():
                 truncation=True,
                 max_length=MAX_TEACHER_TOKENS,
             )
-            t_ids_list.append(enc["input_ids"])
-            t_offs_list.append(enc["offset_mapping"])
-        if offset_unit is None:
-            probe = next((s[0] for s in stud if any(ord(c) > 127 for c in s[0])), None)
-            if probe is not None:
-                offset_unit = resolve_offset_unit(teacher_tok, probe)
-            else:
-                offset_unit = "char"
+            t_ids = enc["input_ids"]
+            t_offs = enc["offset_mapping"]
+            t_starts = [o[0] for o in offsets_to_char(t_offs, offset_unit, ct)]
+            t_ends   = [o[1] for o in offsets_to_char(t_offs, offset_unit, ct)]
+            prepped.append((idx, ct, surface, starts, ends, t_ids, t_starts, t_ends))
+        if not prepped:
+            continue
 
-        Tmax = max(len(t) for t in t_ids_list)
-        Tmax = max(Tmax, 2)
-        input_ids_t = torch.zeros(len(stud), Tmax, dtype=torch.long, device=device)
-        attn_t = torch.zeros(len(stud), Tmax, dtype=torch.long, device=device)
-        for b, tids in enumerate(t_ids_list):
-            if len(tids) > Tmax:
-                tids = tids[:Tmax]
-            input_ids_t[b, :len(tids)] = torch.tensor(tids, dtype=torch.long)
-            attn_t[b, :len(tids)] = 1
+        # 2) 按教师 token 数分桶排序 → 同桶 batch 的 Tmax≈桶内长度，padding 最小化。
+        #    结果按原始 idx 存入 store，与 forward 顺序解耦。
+        store = {}
+        bucketed = sorted(prepped, key=lambda p: len(p[5]))
+        for bi in range(0, len(bucketed), args.batch_size):
+            group = bucketed[bi: bi + args.batch_size]
+            Tmax = max(len(p[5]) for p in group)
+            Tmax = max(Tmax, 2)
+            input_ids_t = torch.zeros(len(group), Tmax, dtype=torch.long, device=device)
+            attn_t = torch.zeros(len(group), Tmax, dtype=torch.long, device=device)
+            for b, p in enumerate(group):
+                tids = p[5]
+                input_ids_t[b, :len(tids)] = torch.tensor(tids, dtype=torch.long)
+                attn_t[b, :len(tids)] = 1
 
-        with torch.inference_mode():
-            logits = model(input_ids=input_ids_t, attention_mask=attn_t).logits
-            logits_shifted = logits[:, :-1, :] / TEMPERATURE
-            lse = torch.logsumexp(logits_shifted, dim=-1, keepdim=True)
-            tk_logits, tk_ids = torch.topk(logits_shifted, k=TOP_K, dim=-1)
-            tk_probs = torch.exp(tk_logits - lse)
-            tk_ids_np = tk_ids.cpu().numpy()
-            tk_probs_np = tk_probs.float().cpu().numpy()
-            del logits, logits_shifted, tk_logits
+            with torch.inference_mode():
+                logits = model(input_ids=input_ids_t, attention_mask=attn_t).logits
+                logits_shifted = logits[:, :-1, :] / TEMPERATURE
+                lse = torch.logsumexp(logits_shifted, dim=-1, keepdim=True)
+                tk_logits, tk_ids = torch.topk(logits_shifted, k=TOP_K, dim=-1)
+                tk_probs = torch.exp(tk_logits - lse)
+                tk_ids_np = tk_ids.cpu().numpy()
+                tk_probs_np = tk_probs.float().cpu().numpy()
+                del logits, logits_shifted, tk_logits
 
-        for b, (ct, subs, surface, starts, ends) in enumerate(stud):
-            t_ids = t_ids_list[b]
-            t_starts = [o[0] for o in offsets_to_char(t_offs_list[b], offset_unit, ct)]
-            t_ends = [o[1] for o in offsets_to_char(t_offs_list[b], offset_unit, ct)]
+            for b, p in enumerate(group):
+                store[p[0]] = (tk_ids_np[b], tk_probs_np[b])
+
+        # 3) 按原始随机顺序组装 chunk（teacher 结果已按文本存好，与 forward 顺序无关）
+        for idx, ct, surface, starts, ends, t_ids, t_starts, t_ends in prepped:
             if len(t_ids) < 2 or len(surface) < 2:
                 continue
+            tk_ids_np, tk_probs_np = store[idx]
             xa, ya, tids_a, tprobs_a, mask_a = build_sample(
                 surface, starts, ends, t_ids, t_starts, t_ends,
-                tk_ids_np[b], tk_probs_np[b], teacher_tok, student_model,
+                tk_ids_np, tk_probs_np, teacher_tok, student_model,
             )
             chunk_x.append(xa); chunk_y.append(ya)
             chunk_tids.append(tids_a); chunk_tprobs.append(tprobs_a)
             chunk_mask.append(mask_a)
             cur_size += 1
+            if cur_size >= args.chunk_size:
+                save_chunk()
 
+        del store, prepped
+        gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
-        if cur_size >= args.chunk_size:
-            save_chunk()
+
+        slab_i = s0 // slab_size + 1
+        print(
+            f"\n[slab {slab_i}/{n_slabs}] 完成,耗时 {time.time() - t0:.1f}s,"
+            f"累计有效样本 {cur_size},当前 chunk {chunk_idx}",
+            flush=True,
+        )
 
     save_chunk()
     print("\n全部 Arrow Chunk 已存盘（已投影到学生词表，可直接训练）。")

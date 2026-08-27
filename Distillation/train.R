@@ -45,42 +45,31 @@ if (length(arrow_files) == 0) {
 # 2. 数据读取与异步生成器定义
 # ==============================================================================
 load_raw_data_from_arrow <- function(file_path) {
-  arrow_df <- arrow::read_feather(file_path)
-  
-  topk_ids_vec <- unlist(arrow_df$topk_ids, use.names = FALSE)
-  real_n_samples <- length(topk_ids_vec) / (512 * 16)
-  
-  # 解包 x (模型输入)
-  if (is.list(arrow_df$x)) {
-    x_mat <- do.call(rbind, arrow_df$x)
-  } else {
-    x_vec <- as.integer(arrow_df$x)[1:(real_n_samples * 512)]
-    x_mat <- matrix(x_vec, nrow = real_n_samples, ncol = 512, byrow = TRUE)
+  # 【性能关键】as_data_frame=FALSE:只 mmap 不物化,避免把千万行 list 列转成 R data.frame
+  # (as_data_frame=TRUE 对 1600 万行的 chunk 要几分钟,这里亚秒级)
+  tb <- arrow::read_feather(file_path, as_data_frame = FALSE)
+  n_rows <- tb$num_rows
+  if (n_rows %% 512 != 0) {
+    stop(sprintf("%s 行数 %d 不是 512 的整数倍,数据布局不符", file_path, n_rows))
   }
-  
-  # 解包 y_hard (交叉熵标签)
-  if (is.list(arrow_df$y_hard)) {
-    y_hard_mat <- do.call(rbind, arrow_df$y_hard)
-  } else {
-    y_hard_vec <- as.integer(arrow_df$y_hard)[1:(real_n_samples * 512)]
-    y_hard_mat <- matrix(y_hard_vec, nrow = real_n_samples, ncol = 512, byrow = TRUE)
-  }
-  
-  # 解包 loss_mask
-  if (is.list(arrow_df$loss_mask)) {
-    mask_mat <- do.call(rbind, arrow_df$loss_mask)
-  } else {
-    mask_vec <- as.logical(arrow_df$loss_mask)[1:(real_n_samples * 512)]
-    mask_mat <- matrix(mask_vec, nrow = real_n_samples, ncol = 512, byrow = TRUE)
-  }
-  
+  n_samples <- as.integer(n_rows / 512)   # 512 = 序列长度
+
+  x_vec    <- as.integer(as.vector(tb$x))
+  y_vec    <- as.integer(as.vector(tb$y_hard))
+  mask_vec <- as.logical(as.vector(tb$loss_mask))
+
+  # fixed_size_list 列:逐 chunk 展开比整体 unlist 快 ~2x
+  # (arrow 25.x 的 FixedSizeListArray$values 绑定缺失不可用,否则可再快 ~50 倍)
+  ids_vec <- do.call(c, lapply(tb$topk_ids$chunks, function(c) unlist(as.vector(c), use.names = FALSE)))
+  pr_vec  <- do.call(c, lapply(tb$topk_probs$chunks, function(c) unlist(as.vector(c), use.names = FALSE)))
+
   list(
-    x          = x_mat,
-    y_hard     = y_hard_mat,
-    loss_mask  = mask_mat,
-    topk_ids   = topk_ids_vec,
-    topk_probs = unlist(arrow_df$topk_probs, use.names = FALSE),
-    n_samples  = as.integer(real_n_samples)
+    x          = matrix(x_vec, nrow = n_samples, ncol = 512, byrow = TRUE),
+    y_hard     = matrix(y_vec, nrow = n_samples, ncol = 512, byrow = TRUE),
+    loss_mask  = matrix(mask_vec, nrow = n_samples, ncol = 512, byrow = TRUE),
+    topk_ids   = ids_vec,
+    topk_probs = pr_vec,
+    n_samples  = n_samples
   )
 }
 
@@ -281,6 +270,27 @@ for (epoch in seq_len(EPOCHS)) {
     ">>> Epoch %d/%d finished. Batches: %d",
     epoch, EPOCHS, batch_idx
   ))
+
+  # 保存本 epoch 检查点（与 03_inference.R 的加载约定一致）
+  if (!dir.exists("checkpoints")) dir.create("checkpoints", showWarnings = FALSE)
+  ckpt_path <- sprintf("checkpoints/distill_model_%02d.pt", epoch)
+  torch_save(
+    list(
+      model     = model$state_dict(),
+      optimizer = optimizer$state_dict(),
+      epoch     = epoch,
+      batch_idx = batch_idx,
+      config    = list(
+        vocab_size  = VOCAB_SIZE,
+        dim         = DIM,
+        n_layers    = N_LAYERS,
+        n_heads     = N_HEADS,
+        max_seq_len = SEQ_LEN
+      )
+    ),
+    ckpt_path
+  )
+  message(sprintf(">>> 已保存检查点: %s", ckpt_path))
 
 }
 

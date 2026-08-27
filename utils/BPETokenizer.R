@@ -52,7 +52,7 @@ RtomicBPETokenizer <- R6Class(
     
     encode_raw = function(text_vector) {
       clean_vector <- self$clean_text_internal(text_vector)
-      res_list <- bpe_encode(self$model, x = text_vector, type = "ids")
+      res_list <- bpe_encode(self$model, x = clean_vector, type = "ids")
       lapply(res_list, function(x) as.integer(x) + 1L)
     },
     
