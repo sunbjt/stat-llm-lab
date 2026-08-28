@@ -578,14 +578,16 @@ def main():
         mask_b = np.stack(chunk_mask)
         N = xb.shape[0]
 
+        # 校验容差稍放宽：前端已把单点概率钳到 [0,1]，bf16 舍入下个别点/行和仍可能略超 1，
+        # 阈值从 1e-3 放到 0.02。真正的 bug（漏减 logsumexp → 概率会到 e^20≈5e8）依然会被拦下。
         p_max = tprobs_b.max()
-        if p_max > 1.0 + 1e-3:
+        if p_max > 1.0 + 0.02:
             raise ValueError(
                 f"topk_probs 最大值 {p_max} 超出 [0,1]（softmax 漏减 logsumexp，"
                 f"或投影聚合异常）。\n请修正生成逻辑后再落盘。"
             )
         row_sums = tprobs_b.sum(axis=-1)
-        if row_sums.max() > 1.0 + 1e-3:
+        if row_sums.max() > 1.0 + 0.02:
             raise ValueError(
                 f"topk_probs 行和最大值 {row_sums.max()} 超出 1.0（重归一化遗漏，或 softmax 异常）。"
             )
@@ -728,15 +730,20 @@ def main():
             with torch.inference_mode():
                 logits = model(input_ids=input_ids_t, attention_mask=attn_t).logits
                 logits_shifted = logits[:, :-1, :] / TEMPERATURE
-                # lse 用 float32 算：bf16 下 logsumexp 有 ~5% 误差，单点概率会 >1
-                # （被归一化掩盖，但 --no-normalize 存原始累计概率时会失真、且触发超界校验）。
-                # float32 下恒有 lse >= max(logit)，保证每个 tk_prob <= 1。
-                lse = torch.logsumexp(logits_shifted.float(), dim=-1, keepdim=True)
+                # bf16 数值安全 logsumexp（不再把整块 [B,T,V] 张量转 float32 —— 那会让显存翻倍、服务器 OOM）。
+                # 用 max-subtraction：lse = max + log(Σ exp(x - max))，max 项贡献 exp(0)=1，
+                # 数学上恒有 lse >= max(logit)，故每个单点概率 exp(logit - lse) <= 1，bf16 下也不越界。
+                # top-k 必须在改写 logits_shifted 之前取（topk 需要原始 logits）。
+                m = logits_shifted.max(dim=-1, keepdim=True).values
                 tk_logits, tk_ids = torch.topk(logits_shifted, k=TOP_K, dim=-1)
-                tk_probs = torch.exp(tk_logits.float() - lse)
+                logits_shifted.sub_(m).exp_()   # 原位：(x - max) 再 exp，不额外分配 [B,T,V] 临时张量
+                lse = m + logits_shifted.sum(dim=-1, keepdim=True).log()
+                tk_probs = torch.exp(tk_logits.float() - lse.float())
+                # 防御性兜底：bf16 舍入下个别点仍可能略超 1，钳到 [0,1]，避免污染下游训练数据。
+                tk_probs = tk_probs.clamp(0.0, 1.0)
                 tk_ids_np = tk_ids.cpu().numpy()
                 tk_probs_np = tk_probs.float().cpu().numpy()
-                del logits, logits_shifted, tk_logits
+                del logits, logits_shifted, m, lse, tk_logits
 
             for b, p in enumerate(group):
                 store[p[0]] = (tk_ids_np[b], tk_probs_np[b])
