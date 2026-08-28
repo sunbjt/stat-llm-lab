@@ -9,11 +9,26 @@
     pip install git+https://github.com/LahiLuk/YouTokenToMe # 装不上用这个
     python3  Distillation/01_ts_span_align.py --self-test   # 先自检学生 BPE 加载/偏移重建
     python3 Distillation/01_ts_span_align.py --limit 50    # 小样本试跑
-    python3 Distillation/01_ts_span_align.py               # 全量
+    python3 Distillation/01_ts_span_align.py --limit 0     # 全量（--limit 0 = 不限文本数）
+    # 注意：不带 --limit 时默认只处理前 100000 条（LIMIT_NUM），不是全量。
 
 若 youtokentome 源码编译失败（备选路线，未实现）：
   本脚本只出教师 top-k ids + 字符偏移 + id→text 词典；
   R 侧用 tokenizers.bpe（同一 C++ 库，已本地验证）完成对齐与投影。
+
+断点续跑（中断后重跑同一命令即可自动继续，无需从头开始）：
+  1. 每个 chunk 落盘时，同目录同步写一个 chunk_XXX.meta.json（含 resume_pos、
+     配置与数据指纹），且 .arrow / .meta.json 都采用"先写临时文件再原子改名"，
+     避免中断留下半截文件。
+  2. 启动时扫描输出目录：
+       - 已有 chunk_001..k（.arrow 与 .meta.json 齐全）→ 从 chunk_{k+1} 续跑，
+         已处理过的文本不再重算、也不重放 tokenize；
+       - 旧版 chunk（只有 .arrow、没有 .meta.json）→ 无法安全续跑，需
+         --force-restart 或手动清掉旧 chunk；
+       - --force-restart → 清空旧 chunk，从头重新生成。
+  3. resume_pos 记录"下一文本在原始 jsonl 中的行号"，续跑时据此跳过已处理的
+     文本；上次中断时内存里未落盘的半截 chunk 会被重新生成（最多重算一个
+     chunk 量级的样本），不影响已存盘 chunk 的连续性。
 ========================================================================
 """
 #!/usr/bin/env python3
@@ -22,6 +37,7 @@
 import argparse
 import bisect
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -350,6 +366,111 @@ def self_test(student_model):
     print("\n✅ 自检通过：学生 BPE 加载正常、字符偏移重建一致。可进入正式生成。")
 
 
+def _atomic_write_json(path, obj):
+    """先写临时文件再原子改名，保证读方永远看不到半截 JSON。"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def cleanup_tmp_files(output_dir):
+    """启动时清理上次中断遗留的 .tmp 写文件（.arrow / .meta.json 的临时件）。"""
+    if not os.path.isdir(output_dir):
+        return
+    for fn in os.listdir(output_dir):
+        if fn.endswith(".arrow.tmp") or fn.endswith(".meta.json.tmp"):
+            p = os.path.join(output_dir, fn)
+            if os.path.isfile(p):
+                os.remove(p)
+                print(f"[cleanup] 移除中断残留 {fn}")
+
+
+def find_resume_point(output_dir):
+    """依据每个 chunk 的断点元数据 chunk_XXX.meta.json 判断续跑点。
+
+    返回 (chunk_idx, resume_pos, prev_meta, legacy)：
+      chunk_idx : 下一个要写入的 chunk 序号（chunk_001..(k-1) 的 .arrow+.meta.json 齐全）
+      resume_pos: 下一文本在原始 jsonl 中的行号（0 起，未处理文本的起点）
+      prev_meta : 最近一个完整 chunk 的断点元数据 dict，或 None
+      legacy    : True 表示存在旧版裸 .arrow（无 .meta.json），无法安全续跑
+
+    判定规则：
+      - chunk_001..k 均同时存在 .arrow 与 .meta.json → 从 k+1 续跑；
+      - 没有任何"完整"chunk，但存在裸 .arrow → 旧版数据（legacy）；
+      - 空目录 → 全新跑。
+    """
+    k = 1
+    prev_meta = None
+    while True:
+        arrow = os.path.join(output_dir, f"chunk_{k:03d}.arrow")
+        meta = os.path.join(output_dir, f"chunk_{k:03d}.meta.json")
+        if not (os.path.isfile(arrow) and os.path.isfile(meta)):
+            break
+        with open(meta, "r", encoding="utf-8") as f:
+            prev_meta = json.load(f)
+        k += 1
+
+    if prev_meta is not None:
+        return k, int(prev_meta["resume_pos"]), prev_meta, False
+
+    # 没有任何“完整”chunk：检查是否残留旧版裸 .arrow
+    if os.path.isdir(output_dir):
+        for fn in os.listdir(output_dir):
+            if re.fullmatch(r"chunk_\d{3}\.arrow", fn):
+                return 1, 0, None, True
+    return 1, 0, None, False
+
+
+def make_data_fp(indexed_texts):
+    """轻量数据指纹：行数 + 首/中/尾几条文本前 512 字符的哈希。
+    用于续跑时发现“输入 jsonl 被换掉”这类粗粒度变更（不做全量哈希）。"""
+    h = hashlib.sha256()
+    h.update(str(len(indexed_texts)).encode("utf-8"))
+    probe = sorted({0, 1, 2, len(indexed_texts) // 2,
+                    len(indexed_texts) - 3, len(indexed_texts) - 2, len(indexed_texts) - 1})
+    for i in probe:
+        if 0 <= i < len(indexed_texts):
+            h.update(repr(indexed_texts[i][1][:512]).encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+def warn_config_mismatch(prev_meta, args, slab_size, data_fp):
+    """续跑时核对上次运行的配置与数据指纹，提示可能导致断点失效的变更。"""
+    prev_cfg = prev_meta.get("config", {}) if prev_meta else {}
+    cur_cfg = {
+        "top_k": TOP_K,
+        "chunk_size": args.chunk_size,
+        "slab_size": slab_size,
+        "limit": args.limit,
+        "input_jsonl": os.path.basename(args.input_jsonl),
+        "student_model": os.path.basename(args.student_model),
+        "model": MODEL_NAME_OR_PATH,
+    }
+    mism = {k: (prev_cfg.get(k), cur_cfg[k]) for k in cur_cfg if prev_cfg.get(k) != cur_cfg[k]}
+    if mism:
+        print("⚠️  断点元数据中的配置与本次运行不一致，续跑结果可能与旧 chunk 不连续：")
+        for k, (old, new) in sorted(mism.items()):
+            print(f"      {k}: 旧={old}  新={new}")
+        print("      - 仅 limit 变大 / 数据追加时可放心续跑；")
+        print("      - 若 chunk_size / top_k / 输入文件已变更，建议 --force-restart 从头重建。")
+    if prev_meta and prev_meta.get("data_fp") and prev_meta["data_fp"] != data_fp:
+        print("⚠️  数据指纹与断点不一致（输入 jsonl 内容疑似变更），断点位置可能失效！")
+        print("      请核对输入文件，必要时 --force-restart。")
+
+
+def clean_chunk_files(output_dir):
+    """--force-restart：删除输出目录里的旧 chunk（.arrow / .meta.json / 临时件）。"""
+    for fn in os.listdir(output_dir):
+        if re.fullmatch(r"chunk_\d{3}(\.arrow|\.meta\.json)(\.tmp)?", fn):
+            p = os.path.join(output_dir, fn)
+            try:
+                os.remove(p)
+                print(f"  删除 {fn}")
+            except OSError as e:
+                print(f"[warn] 删除 {fn} 失败：{e}")
+
+
 def main():
     global TOP_K
     ap = argparse.ArgumentParser(description="Qwen→Rtomic 学生词表投影蒸馏数据生成")
@@ -363,6 +484,8 @@ def main():
     ap.add_argument("--slab-size", type=int, default=0,
                     help="teacher 结果驻留内存的文本批（默认 = chunk_size；调大分桶更细但内存更高）")
     ap.add_argument("--top-k", type=int, default=TOP_K, help="教师 Top-K 投影数（默认 16；越小文件越小）")
+    ap.add_argument("--force-restart", action="store_true",
+                    help="忽略已有 chunk，清空后从头重新生成")
     args = ap.parse_args()
 
     print("=" * 70)
@@ -386,6 +509,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
+    cleanup_tmp_files(args.output_dir)   # 清掉上次中断遗留的半截写文件
 
     student_model = yttm.BPE(args.student_model)
     print("学生 BPE 加载成功，词表大小:", len(student_model.vocab()))
@@ -433,10 +557,10 @@ def main():
 
     chunk_x, chunk_y = [], []
     chunk_tids, chunk_tprobs, chunk_mask = [], [], []
-    chunk_idx, cur_size = 1, 0
+    chunk_idx, cur_size, resume_pos = 1, 0, 0
 
     def save_chunk():
-        nonlocal chunk_x, chunk_y, chunk_tids, chunk_tprobs, chunk_mask, chunk_idx, cur_size
+        nonlocal chunk_x, chunk_y, chunk_tids, chunk_tprobs, chunk_mask, chunk_idx, cur_size, resume_pos
         if cur_size == 0:
             return
         xb = np.stack(chunk_x)
@@ -469,7 +593,28 @@ def main():
             names=["x", "y_hard", "topk_ids", "topk_probs", "loss_mask"],
         )
         out_file = os.path.join(args.output_dir, f"chunk_{chunk_idx:03d}.arrow")
-        feather.write_feather(table, out_file, compression="zstd")
+        tmp_file = out_file + ".tmp"
+        feather.write_feather(table, tmp_file, compression="zstd")
+        os.replace(tmp_file, out_file)   # 原子改名：中断也不会留下半截 chunk
+
+        # 断点元数据：resume_pos = 下一个待处理文本的原始 jsonl 行号。
+        # 先写 .arrow 再写 .meta.json；若在两者之间中断，下次启动时该 chunk 因缺
+        # meta 被判定为“不完整”，续跑会覆盖重写，不会产生空洞。
+        meta_file = out_file.replace(".arrow", ".meta.json")
+        _atomic_write_json(meta_file, {
+            "chunk_idx": chunk_idx,
+            "resume_pos": resume_pos,
+            "data_fp": data_fp,
+            "config": {
+                "top_k": TOP_K,
+                "chunk_size": args.chunk_size,
+                "slab_size": slab_size,
+                "limit": args.limit,
+                "input_jsonl": os.path.basename(args.input_jsonl),
+                "student_model": os.path.basename(args.student_model),
+                "model": MODEL_NAME_OR_PATH,
+            },
+        })
         print(f"\n已存盘 Chunk {chunk_idx}: {out_file}（{cur_size} 条）")
         chunk_x.clear(); chunk_y.clear()
         chunk_tids.clear(); chunk_tprobs.clear(); chunk_mask.clear()
@@ -493,9 +638,45 @@ def main():
     # slab 是 teacher 结果驻留内存的上界：越大分桶越细，但内存越高。
     slab_size = args.slab_size if args.slab_size > 0 else args.chunk_size
 
+    # =====================================================================
+    # 断点续跑：依据每个 chunk 的 chunk_XXX.meta.json（含 resume_pos）判断进度
+    # =====================================================================
+    data_fp = make_data_fp(indexed_texts)
+    chunk_idx, resume_pos, prev_meta, legacy = find_resume_point(args.output_dir)
+    if args.force_restart:
+        clean_chunk_files(args.output_dir)
+        chunk_idx, resume_pos, prev_meta, legacy = 1, 0, None, False
+        print("[--force-restart] 已清空旧 chunk，从头重新生成。")
+    if legacy:
+        print("[错误] 输出目录存在旧版 chunk（只有 .arrow、没有 .meta.json），无法安全续跑。")
+        print("       请任选其一后重试：")
+        print("         1) python 01_ts_span_align.py --force-restart  （清空旧 chunk 从头生成）")
+        print("         2) 手动删除 data/processed/chunks/ 下所有 chunk_*.arrow 后再运行")
+        sys.exit(1)
+    if prev_meta is not None:
+        warn_config_mismatch(prev_meta, args, slab_size, data_fp)
+        print(f"[断点续跑] 已有 chunk_001..{chunk_idx - 1:03d}，从 resume_pos={resume_pos} "
+              f"续写 chunk_{chunk_idx:03d}（无需重放 tokenize）。")
+    else:
+        print("[全新生成] 输出目录无已有 chunk，从头生成。" if chunk_idx == 1
+              else f"[断点续跑] 检测到 chunk 序号缺口，从 chunk_{chunk_idx:03d} 续写。")
+
+    # resume_pos 是“原始 jsonl 行号”→ 转成 indexed_texts 下标，并按 slab 下界对齐
+    p0 = bisect.bisect_left([i for i, _ in indexed_texts], resume_pos)
+    if p0 >= len(indexed_texts):
+        print(f"[完成] 断点 resume_pos={resume_pos} 已越过语料末尾"
+              f"（共 {len(indexed_texts)} 条），全部文本均已处理，无需续跑。")
+        return
+    slab_start = (p0 // slab_size) * slab_size
+
     n_slabs = (total + slab_size - 1) // slab_size
-    for s0 in tqdm(range(0, total, slab_size), desc="Projecting soft labels"):
+    for s0 in tqdm(range(slab_start, total, slab_size), desc="Projecting soft labels"):
         slab = indexed_texts[s0: s0 + slab_size]
+        if s0 == slab_start and resume_pos > 0:
+            # 断点续跑：跳过本段 slab 中 resume_pos 之前的文本（样本已落入已存 chunk）
+            slab = [(i, t) for i, t in slab if i >= resume_pos]
+        if not slab:
+            continue
         t0 = time.time()
 
         # 1) 一次性 token 化（无模型计算）：学生编码 + 教师编码/字符偏移
@@ -550,6 +731,9 @@ def main():
 
         # 3) 按原始随机顺序组装 chunk（teacher 结果已按文本存好，与 forward 顺序无关）
         for idx, ct, surface, starts, ends, t_ids, t_starts, t_ends in prepped:
+            # 本文本已完整处理（tokenize + teacher forward 已完成）：无论是否产出样本，
+            # 都把它记入断点，避免续跑时重算其 teacher forward。
+            resume_pos = idx + 1
             if len(t_ids) < 2 or len(surface) < 2:
                 continue
             tk_ids_np, tk_probs_np = store[idx]

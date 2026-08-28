@@ -21,11 +21,11 @@ plan(multisession, workers = 2)
 ## 1. 环境专属超参配置
 if (is_mac) {
   BATCH_SIZE  <- 2
-  ENV_USE_AMP     <- FALSE
+  ENV_USE_AMP <- FALSE
   ACCUM_STEPS <- 1
 } else {
   BATCH_SIZE  <- 64  # 15M 小模型显存开销极小，RTX 3090 可轻松开启 32~64
-  ENV_USE_AMP     <- TRUE
+  ENV_USE_AMP <- TRUE
   ACCUM_STEPS <- 2
 }
 
@@ -180,7 +180,7 @@ optimizer    <- optim_adamw(model$parameters, lr = LR)
 compute_loss <- distill_loss_fn(temperature = 2.0, alpha = 0.7)
 
 
-EPOCHS = 3
+EPOCHS = 2
 TOP_K = 16
 
 for (epoch in seq_len(EPOCHS)) {
