@@ -103,6 +103,8 @@ BATCH_SIZE = 16
 CHUNK_SIZE = 4096
 LIMIT_NUM = 100000
 
+LSE_CHUNK = 4096            # 教师 logits 求 logsumexp 时按词表维分块的块宽（float32 精度、显存峰值≈一块）
+
 # ---- 学生词表约定 ----
 PAD_SURFACE = 1                     # R 表层 PAD
 UNK_SURFACE = 2                     # R 表层 UNK
@@ -730,20 +732,26 @@ def main():
             with torch.inference_mode():
                 logits = model(input_ids=input_ids_t, attention_mask=attn_t).logits
                 logits_shifted = logits[:, :-1, :] / TEMPERATURE
-                # bf16 数值安全 logsumexp（不再把整块 [B,T,V] 张量转 float32 —— 那会让显存翻倍、服务器 OOM）。
-                # 用 max-subtraction：lse = max + log(Σ exp(x - max))，max 项贡献 exp(0)=1，
-                # 数学上恒有 lse >= max(logit)，故每个单点概率 exp(logit - lse) <= 1，bf16 下也不越界。
-                # top-k 必须在改写 logits_shifted 之前取（topk 需要原始 logits）。
-                m = logits_shifted.max(dim=-1, keepdim=True).values
                 tk_logits, tk_ids = torch.topk(logits_shifted, k=TOP_K, dim=-1)
-                logits_shifted.sub_(m).exp_()   # 原位：(x - max) 再 exp，不额外分配 [B,T,V] 临时张量
-                lse = m + logits_shifted.sum(dim=-1, keepdim=True).log()
-                tk_probs = torch.exp(tk_logits.float() - lse.float())
-                # 防御性兜底：bf16 舍入下个别点仍可能略超 1，钳到 [0,1]，避免污染下游训练数据。
+                # lse 仍用 float32 精度算，但按词表维分块，显存峰值 ≈ 一个分块（不再整块 [B,T,V] 转 float32）。
+                # 为什么不能整块 bf16 算：CUDA 上半精度累加会把 lse 算小（实测单点概率可到 1.12），
+                # 而 float32 分块累加恒有 lse >= max(logit)（max 项贡献 exp(0)=1），保证单点概率 <= 1。
+                m = logits_shifted.max(dim=-1, keepdim=True).values.float()   # [B,T-1,1] float32
+                V = logits_shifted.size(-1)
+                se_sum = None
+                for c0 in range(0, V, LSE_CHUNK):
+                    chunk = logits_shifted[..., c0:c0 + LSE_CHUNK].float()   # bf16→float32 小块
+                    chunk.sub_(m)
+                    chunk.exp_()
+                    se = chunk.sum(dim=-1)                                    # [B,T-1] float32
+                    se_sum = se if se_sum is None else se_sum + se
+                lse = m + se_sum.unsqueeze(-1).log()
+                tk_probs = torch.exp(tk_logits.float() - lse)
+                # 防御性兜底：极端舍入下个别点仍可能略超 1，钳到 [0,1]，避免污染下游训练数据。
                 tk_probs = tk_probs.clamp(0.0, 1.0)
                 tk_ids_np = tk_ids.cpu().numpy()
                 tk_probs_np = tk_probs.float().cpu().numpy()
-                del logits, logits_shifted, m, lse, tk_logits
+                del logits, logits_shifted, m, lse, se_sum, tk_logits
 
             for b, p in enumerate(group):
                 store[p[0]] = (tk_ids_np[b], tk_probs_np[b])
