@@ -11,6 +11,7 @@
     python3 Distillation/01_ts_span_align.py --limit 50    # 小样本试跑
     python3 Distillation/01_ts_span_align.py --limit 0     # 全量（--limit 0 = 不限文本数）
     # 注意：不带 --limit 时默认只处理前 100000 条（LIMIT_NUM），不是全量。
+    python3 Distillation/01_ts_span_align.py --no-normalize --force-restart  # 诊断：存原始累计概率，评估 Top-K 覆盖率（仅供分析，勿直接训练）
 
 若 youtokentome 源码编译失败（备选路线，未实现）：
   本脚本只出教师 top-k ids + 字符偏移 + id→text 词典；
@@ -283,7 +284,7 @@ def find_teacher_signal(b, t_starts, t_ends):
     return j, b - t_starts[k]
 
 
-def project_topk(tids, tprobs, off, teacher_tok, student_model):
+def project_topk(tids, tprobs, off, teacher_tok, student_model, normalize=True):
     agg = {}
     for tid, p in zip(tids, tprobs):
         tid, p = int(tid), float(p)
@@ -300,7 +301,7 @@ def project_topk(tids, tprobs, off, teacher_tok, student_model):
     out_ids = [s for s, _ in items[:TOP_K]]
     out_ps = [p for _, p in items[:TOP_K]]
     tot = sum(out_ps)
-    if tot > 0:
+    if normalize and tot > 0:
         out_ps = [p / tot for p in out_ps]
     pad = TOP_K - len(out_ids)
     if pad > 0:
@@ -310,7 +311,8 @@ def project_topk(tids, tprobs, off, teacher_tok, student_model):
 
 
 def build_sample(surface, starts, ends, t_ids, t_starts, t_ends,
-                 batch_topk_ids, batch_topk_probs, teacher_tok, student_model):
+                 batch_topk_ids, batch_topk_probs, teacher_tok, student_model,
+                 normalize=True):
     L = len(surface)
     n_real = L - 1
     xa = np.full(TARGET_LEN, PAD_SURFACE, dtype=np.int32)
@@ -331,7 +333,8 @@ def build_sample(surface, starts, ends, t_ids, t_starts, t_ends,
         if j >= len(t_ids) - 1:
             continue
         tids, tprobs = project_topk(
-            batch_topk_ids[j], batch_topk_probs[j], off, teacher_tok, student_model
+            batch_topk_ids[j], batch_topk_probs[j], off, teacher_tok, student_model,
+            normalize=normalize,
         )
         tids_a[i] = tids
         tprobs_a[i] = tprobs
@@ -440,6 +443,7 @@ def warn_config_mismatch(prev_meta, args, slab_size, data_fp):
     prev_cfg = prev_meta.get("config", {}) if prev_meta else {}
     cur_cfg = {
         "top_k": TOP_K,
+        "normalize": not args.no_normalize,
         "chunk_size": args.chunk_size,
         "slab_size": slab_size,
         "limit": args.limit,
@@ -484,17 +488,21 @@ def main():
     ap.add_argument("--slab-size", type=int, default=0,
                     help="teacher 结果驻留内存的文本批（默认 = chunk_size；调大分桶更细但内存更高）")
     ap.add_argument("--top-k", type=int, default=TOP_K, help="教师 Top-K 投影数（默认 16；越小文件越小）")
+    ap.add_argument("--no-normalize", action="store_true",
+                    help="不归一化投影后的 topk 概率（存原始累计概率，便于评估 Top-K 覆盖率；默认归一化）")
     ap.add_argument("--force-restart", action="store_true",
                     help="忽略已有 chunk，清空后从头重新生成")
     args = ap.parse_args()
+    normalize = not args.no_normalize
 
     print("=" * 70)
     print(f"[运行脚本] {os.path.abspath(__file__)}")
     print(f"[工作路径] {WORK_DIR}")
     print(f"[运行设备] {device}")
     slab_size = args.slab_size if args.slab_size > 0 else args.chunk_size
-    print(f"[参数] top_k={args.top_k} chunk_size={args.chunk_size} slab_size={slab_size} "
-          f"batch_size={args.batch_size} limit={args.limit} output_dir={args.output_dir}")
+    print(f"[参数] top_k={args.top_k} normalize={normalize} chunk_size={args.chunk_size} "
+          f"slab_size={slab_size} batch_size={args.batch_size} limit={args.limit} "
+          f"output_dir={args.output_dir}")
     print("[归一化检查] tk_probs = exp(tk_logits - lse)（必须存在，否则是旧脚本）")
     print("[自检检查] save_chunk 内置 probs>1 报错（必须存在，否则是旧脚本）")
     print("=" * 70)
@@ -573,13 +581,13 @@ def main():
         p_max = tprobs_b.max()
         if p_max > 1.0 + 1e-3:
             raise ValueError(
-                f"topk_probs 最大值 {p_max} 超出 [0,1]（未归一化，常见于 softmax 漏减 "
-                f"logsumexp，或投影后未归一化）。\n请修正生成逻辑后再落盘。"
+                f"topk_probs 最大值 {p_max} 超出 [0,1]（softmax 漏减 logsumexp，"
+                f"或投影聚合异常）。\n请修正生成逻辑后再落盘。"
             )
         row_sums = tprobs_b.sum(axis=-1)
         if row_sums.max() > 1.0 + 1e-3:
             raise ValueError(
-                f"topk_probs 行和最大值 {row_sums.max()} 超出 1.0（未归一化）。"
+                f"topk_probs 行和最大值 {row_sums.max()} 超出 1.0（重归一化遗漏，或 softmax 异常）。"
             )
 
         table = pa.Table.from_arrays(
@@ -607,6 +615,7 @@ def main():
             "data_fp": data_fp,
             "config": {
                 "top_k": TOP_K,
+                "normalize": normalize,
                 "chunk_size": args.chunk_size,
                 "slab_size": slab_size,
                 "limit": args.limit,
@@ -719,9 +728,12 @@ def main():
             with torch.inference_mode():
                 logits = model(input_ids=input_ids_t, attention_mask=attn_t).logits
                 logits_shifted = logits[:, :-1, :] / TEMPERATURE
-                lse = torch.logsumexp(logits_shifted, dim=-1, keepdim=True)
+                # lse 用 float32 算：bf16 下 logsumexp 有 ~5% 误差，单点概率会 >1
+                # （被归一化掩盖，但 --no-normalize 存原始累计概率时会失真、且触发超界校验）。
+                # float32 下恒有 lse >= max(logit)，保证每个 tk_prob <= 1。
+                lse = torch.logsumexp(logits_shifted.float(), dim=-1, keepdim=True)
                 tk_logits, tk_ids = torch.topk(logits_shifted, k=TOP_K, dim=-1)
-                tk_probs = torch.exp(tk_logits - lse)
+                tk_probs = torch.exp(tk_logits.float() - lse)
                 tk_ids_np = tk_ids.cpu().numpy()
                 tk_probs_np = tk_probs.float().cpu().numpy()
                 del logits, logits_shifted, tk_logits
@@ -740,6 +752,7 @@ def main():
             xa, ya, tids_a, tprobs_a, mask_a = build_sample(
                 surface, starts, ends, t_ids, t_starts, t_ends,
                 tk_ids_np, tk_probs_np, teacher_tok, student_model,
+                normalize=normalize,
             )
             chunk_x.append(xa); chunk_y.append(ya)
             chunk_tids.append(tids_a); chunk_tprobs.append(tprobs_a)
