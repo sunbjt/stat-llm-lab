@@ -50,7 +50,9 @@ generate_causal_text <- function(model,
                                  rep_penalty = 1.15,
                                  top_k = 10) {
   raw_ids <- tokenizer$encode_raw(prompt)[[1]]
-  current_ids <- c(tokenizer$bos_idx, raw_ids)
+  # 训练数据 x 不含 BOS（id=3 从未出现），前置 BOS 会让模型看到从未训练过的
+  # 随机 embedding，污染整条因果链 → 直接以 raw_ids 开头，与训练分布一致。
+  current_ids <- raw_ids
   eos_val <- if (!is.null(tokenizer$eos_idx)) tokenizer$eos_idx else 4L
   
   cat(sprintf("\n[输入 Prompt]: %s\n[模型生成]: ", prompt))

@@ -116,7 +116,7 @@ async_arrow_generator <- function(arrow_files, batch_size, seq_len = 512, top_k 
 # ==============================================================================
 # 3. 蒸馏 Loss 函数定义
 # ==============================================================================
-distill_loss_fn <- function(temperature = 2.0, alpha = 0.7) {
+distill_loss_fn <- function(alpha = 0.4) {
   function(student_logits, target) {
     # Use global DEVICE instead of target$y_hard$device to avoid closure evaluation errors
     dev <- DEVICE 
@@ -133,18 +133,17 @@ distill_loss_fn <- function(temperature = 2.0, alpha = 0.7) {
     safe_topk_ids   <- torch_where(invalid_mask, torch_tensor(1L, device = dev), t_topk_ids)
     safe_topk_probs <- torch_where(invalid_mask, torch_tensor(0.0, device = dev), t_topk_probs)
     
-    # 2. Log Softmax & Gather
-    student_log_probs      <- nnf_log_softmax(student_logits / temperature, dim = 3)
+    # 2. Log Softmax & Gather（T=1，与教师端落盘温度一致；不再除温度）
+    student_log_probs      <- nnf_log_softmax(student_logits, dim = 3)
     student_topk_log_probs <- torch_gather(student_log_probs, dim = 3, index = safe_topk_ids)
-    
-    # 3. KL Divergence
+
+    # 3. KL Divergence（截断 Top-K；教师概率已 normalize，直接使用，不再乘 T^2）
     loss_mask_float     <- loss_mask$to(dtype = torch_float32())
     t_topk_probs_masked <- safe_topk_probs * loss_mask_float$unsqueeze(3)
-    
+
     token_kl <- - torch_sum(t_topk_probs_masked * student_topk_log_probs, dim = 3)
     num_valid_tokens <- loss_mask_float$sum()$clamp(min = 1.0)
     kl_loss <- (token_kl * loss_mask_float)$sum() / num_valid_tokens
-    kl_loss <- kl_loss * (temperature ^ 2)
     
     # 4. Hard Label Cross Entropy
     logits_flat   <- student_logits$view(c(-1, vocab_size))
@@ -177,10 +176,13 @@ IS_CUDA <- cuda_is_available()
 USE_AMP <- IS_CUDA && ENV_USE_AMP
 scaler <- if (USE_AMP) { cuda_amp_grad_scaler() } else { NULL }
 optimizer    <- optim_adamw(model$parameters, lr = LR)
-compute_loss <- distill_loss_fn(temperature = 2.0, alpha = 0.7)
+# alpha 从 0.7 降到 0.4：教师软标签与真实续写错位时，CE 需要更强地锚定真实 token
+compute_loss <- distill_loss_fn(alpha = 0.4)
 
 
 EPOCHS = 2
+# 与 01a_teacher_logits.py / 01b_student_project.py 的 --top-k 保持一致
+# （默认 16；A/B 两阶段生成时必须相同，01b 投影后的 topk 列数即此值）
 TOP_K = 16
 
 for (epoch in seq_len(EPOCHS)) {
