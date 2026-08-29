@@ -47,7 +47,7 @@ try:
 except ImportError:
     yttm = None
 
-# ==================== 1. 环境与路径自动检测（仅路径映射，无模型/设备） ====================
+# ==================== 1. 环境与路径自动检测 ====================
 system_name = platform.system()
 if system_name == "Darwin":
     print("--- 检测到 Mac 环境：本地路径 ---")
@@ -60,34 +60,25 @@ else:
     WORK_DIR = os.path.abspath(".")
     CACHE_DIR = os.path.expanduser("~/cache/huggingface")
 
-# 切换工作目录
 os.chdir(WORK_DIR)
 
-# 基于 WORK_DIR 动态构建相对路径
-TEACHER_CHUNK_DIR = os.path.join(WORK_DIR, "data/processed/teacher_chunks/")  # 阶段 A 输出 = 本阶段输入
-OUTPUT_CHUNK_DIR = os.path.join(WORK_DIR, "data/processed/chunks/")           # 本阶段输出（训练直接消费）
+TEACHER_CHUNK_DIR = os.path.join(WORK_DIR, "data/processed/teacher_chunks/")
+OUTPUT_CHUNK_DIR = os.path.join(WORK_DIR, "data/processed/chunks/")
 STUDENT_MODEL_PATH = os.path.join(WORK_DIR, "models/rtomic_bpe.model")
-
-# 教师模型名仅用于加载 tokenizer（把教师 id decode 成文本，不加载教师模型）
 MODEL_NAME_OR_PATH = "Qwen/Qwen3.5-0.8B"
 
 # ==================== 2. 学生侧超参数 ====================
-STUDENT_VOCAB_SIZE = 2**14        # 16384 (2^14)，对应 config.R 中的 VOCAB_SIZE
-MAX_LENGTH = 512                  # 对应 config.R 中的 SEQ_LEN
-TARGET_LEN = MAX_LENGTH           # Causal LM 输入输出偏移长度 (511)
+STUDENT_VOCAB_SIZE = 2**14        # 16384
+MAX_LENGTH = 512                  
+TARGET_LEN = MAX_LENGTH           
 
-TOP_K = 16                        # 与阶段 A 生成时一致
-CHUNK_SIZE = 2048                 # 每个输出 chunk 的样本条数
+TOP_K = 16                        
+CHUNK_SIZE = 2048                 
 
-# ---- 学生词表约定 ----
-PAD_SURFACE = 1                     # R 表层 PAD
-UNK_SURFACE = 2                     # R 表层 UNK
-MAX_STUDENT_LEN = MAX_LENGTH + 1    # 512：学生 token 序列上限
+PAD_SURFACE = 1                     
+UNK_SURFACE = 2                     
+MAX_STUDENT_LEN = MAX_LENGTH + 1    
 
-# 学生软目标中要剔除的"垃圾表面"：特殊 token (PAD/UNK/BOS/EOS) 与 U+FFFD (词表 id 4346)。
-# 教师稀有词在学生 16384 词表里没有对应表项 → yttm 投影成 UNK；含乱码字符的教师 token → 投影成 U+FFFD。
-# 若让这些垃圾进入软目标，学生会被训练成"不确定时就吐 UNK/�"——生成时直接塌缩成乱码死循环
-# (实测旧数据里 14.8% 的目标质量是垃圾，14.9% 的位置垃圾占比 > 50%)。
 JUNK_SURFACES = frozenset({PAD_SURFACE, UNK_SURFACE, 3, 4, 4346})
 # ===============================================
 
@@ -95,7 +86,6 @@ _PUNCT_RE = re.compile(r"([,.:;!?\"'(){}[\]，。！？；：—（）《》“�
 
 
 def clean_text(text: str) -> str:
-    """复刻 R clean_text_internal：标点隔离 → 空白折叠 → strip。"""
     out = _PUNCT_RE.sub(r" \1 ", text)
     out = re.sub(r"\s+", " ", out)
     return out.strip()
@@ -115,7 +105,6 @@ def student_offsets(subs, ct: str):
         parts[0] = parts[0][1:]
     rebuilt = "".join(parts)
     if rebuilt != ct:
-        # 报错里带首个差异位置,便于定位(通常是截断点后的结尾空白,见 process_text_student)
         for i, (a, b) in enumerate(zip(rebuilt, ct)):
             if a != b:
                 diff = i
@@ -146,11 +135,7 @@ def process_text_student(text: str, student_model):
     L = len(surface)
     if L > MAX_STUDENT_LEN:
         cut = starts[MAX_STUDENT_LEN]
-        ct = ct[:cut]
-        # 截断点可能正好落在一个空格 token 之后（如 " , "），结尾空格在 BPE 里无法重建
-        # （yttm 重建会丢尾部空白 → student_offsets 断言失败）。去掉结尾空白即可，
-        # 不影响已包含 token 的边界偏移。
-        ct = ct.rstrip()
+        ct = ct[:cut].rstrip()
         subs, surface = student_encode(student_model, ct)
         starts, ends = student_offsets(subs, ct)
         L = len(surface)
@@ -166,17 +151,18 @@ _TEACHER_STUDENT_CACHE = {}
 
 
 def teacher_token_student_encoding(tid, teacher_tok, student_model):
+    """【已修复】不再盲目 clean_text 导致解包空格被误删掉，同时增加上限容错保护。"""
     if tid in _TEACHER_STUDENT_CACHE:
         return _TEACHER_STUDENT_CACHE[tid]
 
     txt = teacher_tok.decode([tid])
-    ctxt = clean_text(txt) if txt else ""
-    if not ctxt:
+    if not txt:
         _TEACHER_STUDENT_CACHE[tid] = ([UNK_SURFACE], [0], [1])
         return _TEACHER_STUDENT_CACHE[tid]
 
-    subs = student_model.encode(ctxt, output_type=yttm.OutputType.SUBWORD)
-    ids0 = student_model.encode(ctxt, output_type=yttm.OutputType.ID)
+    # 直接对其编码，不能走 strip() 风格的 clean_text
+    subs = student_model.encode(txt, output_type=yttm.OutputType.SUBWORD)
+    ids0 = student_model.encode(txt, output_type=yttm.OutputType.ID)
     parts = [s.replace("▁", " ") for s in subs]
     if parts and parts[0].startswith(" "):
         parts[0] = parts[0][1:]
@@ -186,23 +172,31 @@ def teacher_token_student_encoding(tid, teacher_tok, student_model):
         starts.append(pos)
         pos += len(p)
         ends.append(pos)
-    if pos != len(ctxt) or len(ids0) != len(parts):
+
+    if pos != len(txt) or len(ids0) != len(parts):
         if not ids0:
-            _TEACHER_STUDENT_CACHE[tid] = ([UNK_SURFACE], [0], [1])
+            res = ([UNK_SURFACE], [0], [1])
         else:
-            _TEACHER_STUDENT_CACHE[tid] = ([min(int(ids0[0]) + 1, STUDENT_VOCAB_SIZE - 1)], [0], [1])
-        return _TEACHER_STUDENT_CACHE[tid]
-    surface = [min(int(i) + 1, STUDENT_VOCAB_SIZE - 1) for i in ids0]
-    _TEACHER_STUDENT_CACHE[tid] = (surface, starts, ends)
-    return _TEACHER_STUDENT_CACHE[tid]
+            res = ([min(int(ids0[0]) + 1, STUDENT_VOCAB_SIZE - 1)], [0], [max(1, len(txt))])
+    else:
+        surface = [min(int(i) + 1, STUDENT_VOCAB_SIZE - 1) for i in ids0]
+        res = (surface, starts, ends)
+
+    # 限制 Cache 体积防泄露
+    if len(_TEACHER_STUDENT_CACHE) < 250000:
+        _TEACHER_STUDENT_CACHE[tid] = res
+    return res
 
 
 def subword_at(surface, starts, ends, off):
+    """【已修复】加入闭区间严格性判定 starts[idx] <= off < ends[idx]。"""
     if not surface:
         return UNK_SURFACE
     idx = bisect.bisect_right(starts, off) - 1
-    idx = max(0, min(idx, len(surface) - 1))
-    return surface[idx]
+    if 0 <= idx < len(surface):
+        if starts[idx] <= off < ends[idx]:
+            return surface[idx]
+    return UNK_SURFACE
 
 
 def find_teacher_signal(b, t_starts, t_ends):
@@ -222,7 +216,6 @@ def project_topk(tids, tprobs, off, teacher_tok, student_model, normalize=True):
         surface, starts, ends = teacher_token_student_encoding(tid, teacher_tok, student_model)
         sid = subword_at(surface, starts, ends, off)
         if sid in JUNK_SURFACES:
-            # 该教师候选投影到 UNK/� 等垃圾表面：不计入学生软目标，不参与重归一化。
             continue
         agg[sid] = agg.get(sid, 0.0) + p
 
@@ -244,12 +237,6 @@ def project_topk(tids, tprobs, off, teacher_tok, student_model, normalize=True):
 def build_sample(surface, starts, ends, n_teacher, t_starts, t_ends,
                  topk_ids, topk_probs, teacher_tok, student_model,
                  normalize=True):
-    """把一条文本组装成学生固定长度样本。
-
-    surface/starts/ends : 学生侧子词表面与字符偏移（本阶段现算）
-    t_starts/t_ends     : 教师侧 token 字符偏移（阶段 A 已落盘）
-    topk_ids/topk_probs : (n_teacher-1, TOP_K) 教师原始 top-K（阶段 A 已落盘）
-    """
     L = len(surface)
     n_real = L - 1
     xa = np.full(TARGET_LEN, PAD_SURFACE, dtype=np.int32)
@@ -281,7 +268,6 @@ def build_sample(surface, starts, ends, n_teacher, t_starts, t_ends,
 
 
 def build_student_sample(row, teacher_tok, student_model, normalize=True):
-    """把阶段 A 的一行（原始教师 soft label）投影成学生样本。"""
     ct = row["ct"]
     n_teacher = int(row["n_teacher"])
     if n_teacher < 2:
@@ -301,7 +287,6 @@ def build_student_sample(row, teacher_tok, student_model, normalize=True):
         raise ValueError(
             f"阶段 A 数据与当前 top_k 不一致：n_teacher={n_teacher}, top_k={K}, "
             f"teacher_ids 长度 {len(ids_flat)} != (n-1)×K = {expect}。"
-            f"\n阶段 A 与阶段 B 必须用相同的 --top-k 生成/投影。"
         )
 
     topk_ids = np.asarray(ids_flat, dtype=np.int32).reshape(n_teacher - 1, K)
@@ -340,10 +325,7 @@ def self_test(student_model):
     print("\n✅ 自检通过：学生 BPE 加载正常、字符偏移重建一致。可进入正式投影。")
 
 
-# ==================== 断点续跑公共机制 ====================
-
 def _atomic_write_json(path, obj):
-    """先写临时文件再原子改名，保证读方永远看不到半截 JSON。"""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -351,7 +333,6 @@ def _atomic_write_json(path, obj):
 
 
 def cleanup_tmp_files(output_dir):
-    """启动时清理上次中断遗留的 .tmp 写文件（.arrow / .meta.json 的临时件）。"""
     if not os.path.isdir(output_dir):
         return
     for fn in os.listdir(output_dir):
@@ -363,14 +344,6 @@ def cleanup_tmp_files(output_dir):
 
 
 def find_resume_point(output_dir):
-    """依据每个 chunk 的断点元数据 chunk_XXX.meta.json 判断续跑点。
-
-    返回 (chunk_idx, resume_pos, prev_meta, legacy)：
-      chunk_idx : 下一个要写入的 chunk 序号（chunk_001..(k-1) 的 .arrow+.meta.json 齐全）
-      resume_pos: 下一文本在原始 jsonl 中的行号（0 起，未处理文本的起点）
-      prev_meta : 最近一个完整 chunk 的断点元数据 dict，或 None
-      legacy    : True 表示存在旧版裸 .arrow（无 .meta.json），无法安全续跑
-    """
     k = 1
     prev_meta = None
     while True:
@@ -385,7 +358,6 @@ def find_resume_point(output_dir):
     if prev_meta is not None:
         return k, int(prev_meta["resume_pos"]), prev_meta, False
 
-    # 没有任何“完整”chunk：检查是否残留旧版裸 .arrow
     if os.path.isdir(output_dir):
         for fn in os.listdir(output_dir):
             if re.fullmatch(r"chunk_\d{3}\.arrow", fn):
@@ -394,7 +366,6 @@ def find_resume_point(output_dir):
 
 
 def warn_config_mismatch(prev_meta, cur_cfg, data_fp):
-    """续跑时核对上次运行的配置与数据指纹，提示可能导致断点失效的变更。"""
     prev_cfg = prev_meta.get("config", {}) if prev_meta else {}
     mism = {k: (prev_cfg.get(k), cur_cfg[k]) for k in cur_cfg if prev_cfg.get(k) != cur_cfg[k]}
     if mism:
@@ -409,7 +380,6 @@ def warn_config_mismatch(prev_meta, cur_cfg, data_fp):
 
 
 def clean_chunk_files(output_dir):
-    """--force-restart：删除输出目录里的旧 chunk（.arrow / .meta.json / 临时件）。"""
     for fn in os.listdir(output_dir):
         if re.fullmatch(r"chunk_\d{3}(\.arrow|\.meta\.json)(\.tmp)?", fn):
             p = os.path.join(output_dir, fn)
@@ -420,17 +390,14 @@ def clean_chunk_files(output_dir):
                 print(f"[warn] 删除 {fn} 失败：{e}")
 
 
-# ==================== 阶段 B：学生词表投影（训练 arrow） ====================
-
 def run_stage_student(args):
     print("=" * 70)
-    print("[阶段 B] 学生词表投影：原始教师 Top-K → 学生 16384 表面（训练直接消费）")
+    print("[阶段 B] 学生词表投影：原始教师 Top-K → 学生 16384 表面")
     print(f"[工作路径] {WORK_DIR}")
 
     if yttm is None:
-        print("缺少依赖 youtokentome（学生 BPE 的 Python 端，与 R 包 tokenizers.bpe 同源）。")
-        print("   pip install Cython")
-        print("   pip install youtokentome")
+        print("缺少依赖 youtokentome。")
+        print("   pip install Cython && pip install youtokentome")
         sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -444,12 +411,10 @@ def run_stage_student(args):
         self_test(student_model)
         return
 
-    # 教师 tokenizer 仅用于把教师 id decode 成文本（不加载模型，快且省显存）
     teacher_tok = AutoTokenizer.from_pretrained(
         MODEL_NAME_OR_PATH, cache_dir=CACHE_DIR, trust_remote_code=True
     )
 
-    # 收集阶段 A chunk（按序号排序）
     a_entries = []
     if os.path.isdir(args.teacher_out_dir):
         for fn in os.listdir(args.teacher_out_dir):
@@ -459,10 +424,8 @@ def run_stage_student(args):
     a_entries.sort()
     if not a_entries:
         print(f"[错误] 阶段 A 输出目录为空: {args.teacher_out_dir}")
-        print("       请先运行: python3 Distillation/01a_teacher_logits.py --limit 0")
         sys.exit(1)
 
-    # 数据指纹：取最后一个阶段 A chunk 的 meta（其 data_fp 源自原始 jsonl）
     data_fp = None
     last_a_meta = None
     last_a_meta_path = os.path.join(args.teacher_out_dir, f"chunk_{a_entries[-1][0]:03d}.meta.json")
@@ -473,10 +436,7 @@ def run_stage_student(args):
     a_limit = last_a_meta.get("config", {}).get("limit", 0) if last_a_meta else 0
 
     normalize = not args.no_normalize
-    print(f"[参数] top_k={TOP_K} normalize={normalize} chunk_size={args.chunk_size} "
-          f"output_dir={args.output_dir} teacher_out_dir={args.teacher_out_dir}")
-    print("[归一化检查] tk_probs = exp(tk_logits - lse)（阶段 A 已保证；投影聚合后保存前会校验 ≤1）")
-    print(f"[阶段 A 数据] {len(a_entries)} 个 teacher chunk，limit={a_limit}")
+    print(f"[参数] top_k={TOP_K} normalize={normalize} chunk_size={args.chunk_size} ")
 
     chunk_x, chunk_y = [], []
     chunk_tids, chunk_tprobs, chunk_mask = [], [], []
@@ -493,19 +453,12 @@ def run_stage_student(args):
         mask_b = np.stack(chunk_mask)
         N = xb.shape[0]
 
-        # 校验容差稍放宽：前端已把单点概率钳到 [0,1]，bf16 舍入下个别点/行和仍可能略超 1，
-        # 阈值从 1e-3 放到 0.02。真正的 bug（漏减 logsumexp → 概率会到 e^20≈5e8）依然会被拦下。
         p_max = tprobs_b.max()
         if p_max > 1.0 + 0.02:
-            raise ValueError(
-                f"topk_probs 最大值 {p_max} 超出 [0,1]（softmax 漏减 logsumexp，"
-                f"或投影聚合异常）。\n请修正生成逻辑后再落盘。"
-            )
+            raise ValueError(f"topk_probs 最大值 {p_max} 超出 [0,1]")
         row_sums = tprobs_b.sum(axis=-1)
         if row_sums.max() > 1.0 + 0.02:
-            raise ValueError(
-                f"topk_probs 行和最大值 {row_sums.max()} 超出 1.0（重归一化遗漏，或 softmax 异常）。"
-            )
+            raise ValueError(f"topk_probs 行和最大值 {row_sums.max()} 超出 1.0")
 
         table = pa.Table.from_arrays(
             [
@@ -520,9 +473,8 @@ def run_stage_student(args):
         out_file = os.path.join(args.output_dir, f"chunk_{chunk_idx:03d}.arrow")
         tmp_file = out_file + ".tmp"
         feather.write_feather(table, tmp_file, compression="zstd")
-        os.replace(tmp_file, out_file)   # 原子改名：中断也不会留下半截 chunk
+        os.replace(tmp_file, out_file)
 
-        # 断点元数据：resume_pos = 下一个待投影文本的原始 jsonl 行号。
         meta_file = out_file.replace(".arrow", ".meta.json")
         _atomic_write_json(meta_file, {
             "chunk_idx": chunk_idx,
@@ -545,17 +497,13 @@ def run_stage_student(args):
         chunk_idx += 1
         gc.collect()
 
-    # =====================================================================
-    # 断点续跑（本阶段输出目录）
-    # =====================================================================
     chunk_idx, resume_pos, prev_meta, legacy = find_resume_point(args.output_dir)
     if args.force_restart:
         clean_chunk_files(args.output_dir)
         chunk_idx, resume_pos, prev_meta, legacy = 1, 0, None, False
         print("[--force-restart] 已清空阶段 B 旧 chunk，从头重新投影。")
     if legacy:
-        print("[错误] 阶段 B 输出目录存在旧版裸 .arrow（无 .meta.json），无法安全续跑。")
-        print("       请 --force-restart 或手动清空 data/processed/chunks/。")
+        print("[错误] 阶段 B 输出目录存在旧版裸 .arrow，无法安全续跑。")
         sys.exit(1)
     if prev_meta is not None:
         warn_config_mismatch(prev_meta, {
@@ -567,12 +515,8 @@ def run_stage_student(args):
             "student_model": os.path.basename(args.student_model),
             "model": MODEL_NAME_OR_PATH,
         }, data_fp)
-        print(f"[断点续跑] 已有 chunk_001..{chunk_idx - 1:03d}，从 resume_pos={resume_pos} 续写。")
-    else:
-        print("[全新生成] 阶段 B 输出目录无已有 chunk，从头投影。" if chunk_idx == 1
-              else f"[断点续跑] 检测到 chunk 序号缺口，从 chunk_{chunk_idx:03d} 续写。")
+        print(f"[断点续跑] 从 resume_pos={resume_pos} 续写。")
 
-    # 遍历阶段 A chunk：整块已消费（max text_idx < resume_pos）的跳过
     for a_idx, af in a_entries:
         a_meta = None
         a_meta_path = os.path.join(args.teacher_out_dir, f"chunk_{a_idx:03d}.meta.json")
@@ -580,7 +524,7 @@ def run_stage_student(args):
             with open(a_meta_path, "r", encoding="utf-8") as f:
                 a_meta = json.load(f)
         if a_meta is not None and int(a_meta.get("resume_pos", 0)) - 1 < resume_pos:
-            continue  # 该阶段 A chunk 已全部投影进已存盘的阶段 B chunk
+            continue
 
         table = pa.feather.read_table(af)
         n_rows = table.num_rows
@@ -606,23 +550,20 @@ def run_stage_student(args):
               f"（{n_rows} 行），累计样本 {cur_size}，chunk {chunk_idx}", flush=True)
 
     save_chunk()
-    print("\n全部 Arrow Chunk 已存盘（已投影到学生词表，可直接训练）。")
+    print("\n全部 Arrow Chunk 已存盘。")
 
 
 def main():
     global TOP_K
-    ap = argparse.ArgumentParser(description="阶段 B：学生词表投影出训练 arrow（消费 01a_teacher_logits.py 的输出）")
+    ap = argparse.ArgumentParser(description="阶段 B：学生词表投影")
     ap.add_argument("--student-model", default=STUDENT_MODEL_PATH)
-    ap.add_argument("--teacher-out-dir", default=TEACHER_CHUNK_DIR,
-                    help="阶段 A 输出目录（本阶段输入）")
-    ap.add_argument("--output-dir", default=OUTPUT_CHUNK_DIR, help="本阶段输出目录（训练直接消费）")
-    ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, help="每个输出 chunk 的样本条数")
-    ap.add_argument("--top-k", type=int, default=TOP_K, help="教师 Top-K（默认 16；须与阶段 A 一致）")
-    ap.add_argument("--no-normalize", action="store_true",
-                    help="不归一化投影后的 topk 概率（存原始累计概率，诊断用；默认归一化）")
-    ap.add_argument("--self-test", action="store_true", help="学生 BPE 自检")
-    ap.add_argument("--force-restart", action="store_true",
-                    help="忽略已有输出 chunk，清空后从头重新投影")
+    ap.add_argument("--teacher-out-dir", default=TEACHER_CHUNK_DIR)
+    ap.add_argument("--output-dir", default=OUTPUT_CHUNK_DIR)
+    ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
+    ap.add_argument("--top-k", type=int, default=TOP_K)
+    ap.add_argument("--no-normalize", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--force-restart", action="store_true")
     args = ap.parse_args()
     TOP_K = args.top_k
 
