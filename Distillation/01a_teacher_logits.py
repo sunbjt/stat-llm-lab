@@ -29,12 +29,14 @@
 ========================================================================
 """
 
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import argparse
 import bisect
 import gc
 import hashlib
 import json
-import os
 import platform
 import re
 import sys
