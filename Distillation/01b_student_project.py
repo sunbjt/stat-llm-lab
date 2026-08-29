@@ -28,11 +28,13 @@ data/processed/teacher_chunks/）→ 学生 BPE 重新编码 clean 文本 → �
 ========================================================================
 """
 
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import argparse
 import bisect
 import gc
 import json
-import os
 import platform
 import re
 import sys
