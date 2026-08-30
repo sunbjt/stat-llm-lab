@@ -23,7 +23,7 @@ data/processed/teacher_chunks/）→ 学生 BPE 重新编码 clean 文本 → �
     pip install youtokentome           # 与 R 包 tokenizers.bpe 同一 C++ 库
     python3 Distillation/01b_student_project.py --self-test     # 学生 BPE 自检
     python3 Distillation/01b_student_project.py --force-restart # 重新投影（改配置后务必全量重建）
-    python3 Distillation/01b_student_project.py --no-normalize  # 诊断：存原始累计概率（勿直接训练）
+    python3 Distillation/01b_student_project.py --no-normalize  # 存原始累计概率（直接用于训练）
     # 注意：--top-k 必须与阶段 A 生成时一致（默认 16）；学生词表默认 16384。
 ========================================================================
 """

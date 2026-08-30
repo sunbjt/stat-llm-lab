@@ -16,7 +16,7 @@ source("causal_lm/CausalLM_model.R")
 plan(multisession, workers = 2)
 
 if (is_mac) {
-  BATCH_SIZE  <- 2
+  BATCH_SIZE  <- 4
   ENV_USE_AMP <- FALSE
   ACCUM_STEPS <- 1
 } else {
@@ -104,50 +104,60 @@ async_arrow_generator <- function(arrow_files, batch_size, seq_len = 512, top_k 
 }
 
 # ==============================================================================
-# 3. 蒸馏 Loss 函数定义 (修正维度 BUG、边界 protection 与 0.5% 全 0 掩码)
+# 3. 蒸馏 Loss 函数定义
 # ==============================================================================
-distill_loss_fn <- function(alpha = 0.4) {
+distill_loss_fn <- function(alpha = 0.8, temp = 1.0) {
   function(student_logits, target) {
     dev <- DEVICE 
-    # R torch 中 3 维张量 dim(3) 即为 Vocab Dim
     vocab_size <- student_logits$size(3) 
     
     y_hard       <- target$y_hard$to(device = dev)
     t_topk_ids   <- target$topk_ids$to(device = dev)
-    t_topk_probs <- target$topk_probs$to(device = dev)
+    t_topk_probs <- target$topk_probs$to(device = dev) # 原始未归一化的 TopK 概率
     loss_mask    <- target$loss_mask$to(device = dev)
     
-    # 1. 越界保护 (Torch 索引按 1 开始，需保护范围 [1, vocab_size])
+    # 1. 越界保护
     invalid_mask    <- (t_topk_ids <= 0L) | (t_topk_ids > vocab_size)
     safe_topk_ids   <- torch_where(invalid_mask, torch_tensor(1L, device = dev), t_topk_ids)
     safe_topk_probs <- torch_where(invalid_mask, torch_tensor(0.0, device = dev), t_topk_probs)
     
-    # 2. Log Softmax & Gather 提取学生 logits
-    student_log_probs      <- nnf_log_softmax(student_logits, dim = 3)
+    # 2. 计算 Coverage M (即原始 TopK 概率和)
+    M <- safe_topk_probs$sum(dim = 3, keepdim = TRUE) # [B, Seq_Len, 1]
+    
+    # 归一化教师 TopK 分布 q_T (避免 0/0 加 eps)
+    q_T <- safe_topk_probs / (M + 1e-8)
+    
+    # 3. Log Softmax & Gather 提取学生 logits (带温度 T)
+    student_log_probs      <- nnf_log_softmax(student_logits / temp, dim = 3)
     student_topk_log_probs <- torch_gather(student_log_probs, dim = 3, index = safe_topk_ids)
 
-    # 3. KL Divergence (屏蔽 loss_mask=FALSE 以及 0.5% 概率全 0 的位置)
-    loss_mask_float     <- loss_mask$to(dtype = torch_float32())
-    prob_sums           <- safe_topk_probs$sum(dim = 3) # [batch, seq_len]
-    valid_kl_mask       <- (prob_sums > 0.0)$to(dtype = torch_float32()) * loss_mask_float
+    # 4. 计算标准 KL 散度: D_KL(q_T || p_S)
+    loss_mask_float <- loss_mask$to(dtype = torch_float32())
+    valid_kl_mask   <- (M$squeeze(3) > 0.0)$to(dtype = torch_float32()) * loss_mask_float
 
-    t_topk_probs_masked <- safe_topk_probs * valid_kl_mask$unsqueeze(3)
-    token_kl            <- - torch_sum(t_topk_probs_masked * student_topk_log_probs, dim = 3)
+    q_T_clamped     <- torch_clamp(q_T, min = 1e-8, max = 1.0)
+    q_T_log         <- torch_log(q_T_clamped)
+    
+    # 标准 KL: sum( q_T * (log(q_T) - log(p_S)) )
+    kl_raw <- torch_sum(q_T * (q_T_log - student_topk_log_probs), dim = 3) # [B, Seq_Len]
+    
+    # 【核心逻辑】：应用 Coverage M 进行加权: M * D_KL
+    token_kd <- M$squeeze(3) * kl_raw
     
     num_valid_kl_tokens <- valid_kl_mask$sum()$clamp(min = 1.0)
-    kl_loss             <- (token_kl * valid_kl_mask)$sum() / num_valid_kl_tokens
+    kd_loss             <- (token_kd * valid_kl_mask)$sum() / num_valid_kl_tokens
     
-    # 4. Hard Label Cross Entropy (更安全的向量化展开)
-    logits_flat <- student_logits$view(c(-1, vocab_size))
-    y_flat      <- y_hard$view(c(-1))
-    mask_flat   <- loss_mask$view(c(-1))
-    
-    # 将被 mask 掉的位置用 -100 替代，nnf_cross_entropy 默认忽略 -100
+    # 5. Hard Label Cross Entropy
+    logits_flat   <- student_logits$view(c(-1, vocab_size))
+    y_flat        <- y_hard$view(c(-1))
+    mask_flat     <- loss_mask$view(c(-1))
     y_flat_masked <- torch_where(mask_flat, y_flat, torch_tensor(-100L, device = dev))
+    
     ce_loss       <- nnf_cross_entropy(logits_flat, y_flat_masked, ignore_index = -100L)
     
-    total <- alpha * kl_loss + (1 - alpha) * ce_loss
-    list(total = total, kl = kl_loss, ce = ce_loss)
+    # 6. 总 Loss (融入 T^2 梯度缩放)
+    total <- (1 - alpha) * (temp^2) * kd_loss + alpha * ce_loss
+    list(total = total, kl = kd_loss, ce = ce_loss)
   }
 }
 
