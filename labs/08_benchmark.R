@@ -100,6 +100,18 @@ MODEL_REGISTRY <- list(
       model$load_state_dict(sd, strict = FALSE)
     },
     output = "logits"
+  ),
+
+  distill = list(
+    label  = "distill",
+    source = "causal_lm/CausalLM_model.R",
+    construct = function() RtomicCausalLM(VOCAB_SIZE, DIM, N_LAYERS, N_HEADS, SEQ_LEN),
+    ckpt   = "checkpoints/distill_kl_sft_epoch_05.pt",
+    load_fn = function(model, raw) {
+      sd <- if ("model" %in% names(raw)) raw$model else raw
+      model$load_state_dict(sd, strict = FALSE)
+    },
+    output = "logits"
   )
 )
 
@@ -265,8 +277,8 @@ compare_models <- function(model_keys, dataset_path) {
 # ==========================================
 target_models <- c("lrp") # 若要多模型对比传入 c("lrp", "causal", "jepa", "moe")
 target_models <- c("causal", "lrp", "contrastive", "jepa", "moe")
-benchmark_file <- "labs/files/benchmark_1300_v2.jsonl"
 
+benchmark_file <- "labs/files/benchmark_1300_v2.jsonl"
 comparison_report <- compare_models(target_models, benchmark_file)
 
 # 输出聚合详情
@@ -365,7 +377,7 @@ df_plot <- df_all %>%
   )
 
 # 4. 绘图
-ggplot(df_plot, aes(y = category_zh)) +
+p <- ggplot(df_plot, aes(y = category_zh)) +
   # 背景线条
   geom_segment(
     data = df_summary %>% mutate(category_zh = factor(category_zh, levels = cat_order)),
@@ -415,4 +427,13 @@ ggplot(df_plot, aes(y = category_zh)) +
     y = NULL,
     color = "评测模型"
   )
+p
 
+ggsave(
+  filename = "~/github/stat-llm-lab/img/distill_acc.png",  # 文件名
+  plot = p,                  # 你的 ggplot 对象
+  width = 8,                 # 图片宽度
+  height = 5,                # 图片高度
+  units = "in",              # 单位：英寸 (in), 厘米 (cm), 毫米 (mm), 像素 (px)
+  dpi = 300                  # 分辨率，300 dpi 是出版物标准
+)
