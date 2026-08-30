@@ -660,7 +660,7 @@ forward = function(input_data, output_hidden_states = FALSE) {
 这里也可以直观看一下为什么 Top16 的 token 可以做软蒸：
 
 <div align="center">
-<img src="img/top8_top16.png" alt="关于 topK 的选择" width="80%">
+<img src="img/top8_top16.png" alt="关于 topK 的选择" width="70%">
 </div>
 
 从 Top8 到 Top16 的累计概率的中值仅仅提高了 5%，估算提高到 Top32 累计概率约为 1%，但要付出额外 100% 的存储代价。
@@ -672,10 +672,10 @@ python Distillation/01a_teacher_logits.py --limit 0        # 全量生成教师�
 python Distillation/01b_student_project.py --no-normalize  # 组装成 R 能读取的 arrow 格式
 ```
 
-在蒸馏实验里，我们重构了数据的组织方式，不再是原始项目中所有文本连接起来，而是每篇文档长度在 512 以下则被截断。因此去掉 KL loss 退化为 causal LM 同前面实验的 causal LM 结果不一致。用 $0.4 \times \text{CE loss} + 0.6 \times \text{KL loss} 的蒸馏模型比对退化为 causal LM 模型，是这样的：
+在蒸馏实验里，我们重构了数据的组织方式，不再是原始项目中所有文本连接起来，而是每篇文档长度在 512 以下则被截断。因此去掉 KL loss 退化为 causal LM 同前面实验的 causal LM 结果不一致。用 $0.4 \times \text{CE loss} + 0.6 \times \text{KL loss}$ 的蒸馏模型比对退化为 causal LM 模型，是这样的：
 
 <div align="center">
-<img src="img/distill_acc.png" alt="消融实验" width="80%">
+<img src="img/distill_acc.png" alt="消融实验" width="70%">
 </div>
 
 预期通过从教师模型蒸馏更多的信息以提高学生模型的智力水平，但实际结果恰恰相反，蒸馏降低了学生模型在测评上的评分。明显拖后腿的类别为：
