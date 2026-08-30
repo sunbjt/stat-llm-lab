@@ -11,7 +11,7 @@ BATCH_SIZE <- if (is_mac) 2 else 32
 device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
 cat(sprintf("当前运行设备: %s\n", device$type))
 
-PRETRAIN_CKPT <- "checkpoints/causal_model_02.pt"
+PRETRAIN_CKPT <- "checkpoints/distill_model_02.pt"
 
 # =====================================================================
 # 1. 加载 Tokenizer 与模型架构
@@ -168,6 +168,6 @@ for (epoch in 1:EPOCHS) {
   
   scheduler$step()
   
-  save_path <- sprintf("checkpoints/causal_sft_epoch_%02d.pt", epoch)
+  save_path <- sprintf("checkpoints/distill_sft_epoch_%02d.pt", epoch)
   torch_save(model$state_dict(), save_path)
 }

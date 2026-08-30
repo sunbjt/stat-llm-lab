@@ -5,26 +5,8 @@ library(tidyr)
 library(data.table)
 library(tidyverse)
 
-dataset_path <- "~/Downloads/001267.parquet"
-arrow_table <- read_parquet(dataset_path)
+dataset_path <- "~/github/stat-llm-lab/data/processed/chunks/chunk_001.arrow"
+arrow_table <- read_feather(dataset_path)
 
-arrow_table |>
-  group_by(category) |>
-  count()
-
-arrow_table |>
-  filter(category == 'educational') |>
-  select(text) |>
-  head(5) |>
-  as.vector()
-
-set.seed(2026) # 设置随机种子，确保结果可重复
-sampled_data <- arrow_table |>
-  select(category, 'num-tokens', text) |>
-  group_by(category) |>               # 按类别分组
-  slice_sample(n = 100) |>            # 每组随机抽取 100 行
-  ungroup()
-
-output_file <- "data/processed/sample.jsonl"
-jsonlite::stream_out(sampled_data, file(output_file), verbose = FALSE)
-
+head(arrow_table$topk_ids[[1]], 10)
+head(arrow_table$topk_probs[[1]], 10)
