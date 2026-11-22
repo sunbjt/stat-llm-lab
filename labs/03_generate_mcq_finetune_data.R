@@ -252,7 +252,7 @@ INCLUDE_EXPLANATION <- FALSE                         # 见下方说明，先建�
 raw <- stream_in(file(INPUT_FILE), verbose = FALSE)
 cat(sprintf("读入原始题目: %d 条\n", nrow(raw)))
 
-# ---- 2b. 兼容 stream_in 对嵌套 options 字段的两种可能解析结果：
+# ---- 2. 兼容 stream_in 对嵌套 options 字段的两种可能解析结果：
 #      情况一：raw$options 被简化成 4 列(A/B/C/D)的 data.frame（jsonlite 默认行为）
 #      情况二：raw$options 是每行一个 named list 组成的 list-column
 get_option_col <- function(options_field, letter) {
@@ -274,6 +274,36 @@ opt_A <- get_option_col(raw$options, "A")
 opt_B <- get_option_col(raw$options, "B")
 opt_C <- get_option_col(raw$options, "C")
 opt_D <- get_option_col(raw$options, "D")
+answer <- as.character(raw$answer)
+
+cat("重排前各类别答案字母分布：\n")
+print(table(as.character(raw$category), answer))
+
+# ---- 2.5 强制随机打乱每道题的选项顺序 ----
+# 生成阶段大模型出题时选项顺序严重不均匀（比如 D 选项极少作为正确答案），
+# 15M 小模型会直接学"哪个字母出现概率高就选哪个"这个捷径，而不是真的读题。
+# 这里在源头把每道题的四个选项随机重排，重新计算正确答案对应的新字母，
+# 从数据结构上消除这个捷径特征。只操作 opt_A/B/C/D 这四个纯向量，跟
+# raw$options 原始的底层结构（data.frame 还是 list）完全无关，更稳妥。
+opt_mat <- cbind(A = opt_A, B = opt_B, C = opt_C, D = opt_D)
+letters4 <- c("A", "B", "C", "D")
+
+new_opt_mat <- matrix(NA_character_, nrow = nrow(opt_mat), ncol = 4,
+                      dimnames = list(NULL, letters4))
+new_answer <- character(nrow(opt_mat))
+
+for (i in seq_len(nrow(opt_mat))) {
+  perm <- sample(letters4)                    # 新顺序，比如 c("C","A","D","B")
+  new_opt_mat[i, ] <- opt_mat[i, perm]         # 新的第j个选项 = 原来第perm[j]个选项的文本
+  new_answer[i] <- letters4[which(perm == answer[i])]
+}
+
+opt_A <- new_opt_mat[, "A"]; opt_B <- new_opt_mat[, "B"]
+opt_C <- new_opt_mat[, "C"]; opt_D <- new_opt_mat[, "D"]
+raw$answer <- new_answer
+
+cat("\n重排后各类别答案字母分布（应接近均匀）：\n")
+print(table(as.character(raw$category), raw$answer))
 
 build_instruction <- function(question, A, B, C, D) {
   sprintf(
@@ -330,9 +360,9 @@ dev_df   <- dev_df[sample(nrow(dev_df)), ]
 cat("\n各类别训练样本数：\n")
 print(table(train_df$category))
 
-# ---- 6. 落盘为 04_sft_train.R 期望的格式（只需要 instruction/output 两列） ----
+# ---- 6. 落盘。train 只需要 instruction/output；dev 额外保留 category，方便按类别看 acc ----
 stream_out(train_df[, c("instruction", "output")], file(OUTPUT_TRAIN), verbose = FALSE)
-stream_out(dev_df[,   c("instruction", "output")], file(OUTPUT_DEV),   verbose = FALSE)
+stream_out(dev_df[,   c("category", "instruction", "output")], file(OUTPUT_DEV), verbose = FALSE)
 
 cat(sprintf("\n完成。\n训练集: %d 条 -> %s\n验证集: %d 条 -> %s\n",
             nrow(train_df), OUTPUT_TRAIN, nrow(dev_df), OUTPUT_DEV))
