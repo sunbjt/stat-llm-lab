@@ -6,7 +6,7 @@
 
 本项目使用 R 语言的 `torch` + `luz` 深度学习框架，实现了多种 LLM（大语言模型）架构，涵盖从经典因果语言模型到实验性的 JEPA、对比学习、潜在空间残差预测、MoE 模型训练等前沿方法，以及蒸馏（软标签）、UI 部署、大模型的评测、统计水印（Deepfake 披露）等技术。
 
-读者有兴趣可以访问在线 Demo（潜在空间残差预测）：<http://110.40.168.251:8080>
+读者有兴趣可以访问在线 Demo（潜在空间残差预测）：[https://rtorchbook.cc/llm](https://rtorchbook.cc/llm)
 
 <div align="center">
 <img src="img/server.png" alt="服务示例" width="85%">
