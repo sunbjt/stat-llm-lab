@@ -64,14 +64,14 @@ async_translate <- function(batch_list, api_key,
                             max_tries = 3) {
   
   system_prompt <- paste0(
-    "You are a Wikipedia concept translator and encyclopedist. ",
+    "You are an expert technical writer and knowledge graph generator for LLM pre-training and instruction tuning. ",
     "For each concept in the input list, you must:\n",
-    "1. Translate the English concept name to accurate Chinese.\n",
+    "1. Translate the English concept name to high-density, precise and structurally rigorous Chinese.\n",
     "2. Write a detailed Chinese explanation covering:\n",
-    "   - What the concept is (core definition)\n",
+    "   - What the concept is (highly informative and detailed explanation)\n",
     "   - Key technical ideas / how it works\n",
-    "   - Real-world applications and significance\n",
-    "   - Relationship to other concepts in the field if relevant\n",
+    "   - Primary real-world use cases, industrial value, and technical advantages\n",
+    "   - Connections or contrasts with upstream/downstream concepts in the domain.\n",
     "Aim for 10-15 detailed sentences per concept. Do NOT write a one-liner.\n",
     "Return ONLY a valid JSON array. No markdown, no code fences, no extra text.\n",
     'Format: [{"name":"<original>","name_cn":"<Chinese translation>","explanation":"<detailed Chinese explanation>","pagerank":<number>}]'
@@ -144,7 +144,7 @@ async_translate <- function(batch_list, api_key,
 # ---- 4. 分块并发翻译（带断点续传与 JSONL 追加落盘） ----
 cat("\n--- Starting Parallel Translation ---\n")
 batch_size     <- 20   # 每个 API 请求包含的概念数
-max_concurrent <- 10   # 同时并发的 API 请求数
+max_concurrent <- 50   # 同时并发的 API 请求数
 output_file    <- "concepts_translated_china.jsonl"
 progress_file  <- "translate_progress_china.Rdata"
 
